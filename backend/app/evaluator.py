@@ -1,10 +1,7 @@
-"""LLM-as-judge evaluator.
+"""LLM-as-judge evaluator using Amazon Bedrock.
 
 Scores the generic ("before") and adapted ("after") answers for the same
-question using an LLM with a scoring rubric. Uses the same provider as the
-chat agent:
-  - bedrock -> Strands + Amazon Bedrock
-  - mock    -> deterministic placeholder (no LLM)
+question using Bedrock with a scoring rubric.
 
 Returns a list of EvalMetric (metric, generic, adapted) plus a short verdict
 sentence, so the UI can render a compact comparison.
@@ -12,9 +9,12 @@ sentence, so the UI can render a compact comparison.
 from __future__ import annotations
 
 import json
+import logging
 
 from app.config import get_settings
 from app.models import ContextPack, EvalMetric
+
+logger = logging.getLogger(__name__)
 
 # The dimensions the judge scores (0-100 each) for BOTH answers.
 # "Industry scoped" measures how well the answer fits the SELECTED industry
@@ -69,20 +69,14 @@ def evaluate(
     `industry` is the industry selected in the sidebar; it drives the
     "Industry scoped" metric.
     """
-    settings = get_settings()
-    provider = settings.llm_provider.lower()
     industry_name = _resolve_industry(pack, industry)
 
-    if provider == "bedrock":
-        try:
-            data = _judge_with_bedrock(_rubric(question, generic, adapted, pack, industry_name))
-            return _to_result(data)
-        except Exception as exc:  # noqa: BLE001
-            print(f"[evaluator] bedrock judge failed: {exc}")
-            return _fallback(generic, adapted, pack)
-
-    # mock
-    return _fallback(generic, adapted, pack)
+    try:
+        data = _judge_with_bedrock(_rubric(question, generic, adapted, pack, industry_name))
+        return _to_result(data)
+    except Exception as exc:  # noqa: BLE001
+        logger.error(f"[evaluator] bedrock judge failed: {exc}")
+        return _fallback(generic, adapted, pack)
 
 
 # --------------------------------------------------------------------------

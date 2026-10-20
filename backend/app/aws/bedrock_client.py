@@ -1,34 +1,28 @@
-"""Thin wrapper around the AWS calls for KB retrieval and guardrail creation.
+"""Bedrock Runtime wrapper for chat and guardrail operations.
 
-Behaviour is gated by MOCK_MODE (storage/AWS switch):
-  - mock (MOCK_MODE=true)  : no AWS; returns realistic canned data.
-  - real (MOCK_MODE=false) : boto3 calls to Bedrock Runtime (converse),
-            Bedrock Agent Runtime (KB retrieve), and the Bedrock control
-            plane (create guardrail).
-
-Note: chat answers normally go through app.agent, which picks the provider via
-LLM_PROVIDER. `converse()` here is only used by the agent's "mock" provider
-path. Keeping AWS calls behind this class means the rest of the code is
-identical across modes.
+Provides a thin interface to AWS Bedrock for:
+- Converse API (chat with guardrails)
+- Agent Runtime Retrieve (KB vector search)
+- Control Plane operations (create guardrails)
 """
 from __future__ import annotations
 
+import logging
+
 from app.config import get_settings
+
+logger = logging.getLogger(__name__)
 
 
 class BedrockClient:
     def __init__(self) -> None:
         self.settings = get_settings()
-        self.mock = self.settings.mock_mode
-        self._runtime = None       # bedrock-runtime (Converse / InvokeModel)
-        self._agent_runtime = None # bedrock-agent-runtime (KB retrieve)
-        self._control = None       # bedrock (guardrails, create)
-        if not self.mock:
-            import boto3
-            region = self.settings.aws_region
-            self._runtime = boto3.client("bedrock-runtime", region_name=region)
-            self._agent_runtime = boto3.client("bedrock-agent-runtime", region_name=region)
-            self._control = boto3.client("bedrock", region_name=region)
+        import boto3
+
+        region = self.settings.aws_region
+        self._runtime = boto3.client("bedrock-runtime", region_name=region)
+        self._agent_runtime = boto3.client("bedrock-agent-runtime", region_name=region)
+        self._control = boto3.client("bedrock", region_name=region)
 
     # ------------------------------------------------------------------ chat
     def converse(
@@ -40,10 +34,18 @@ class BedrockClient:
         guardrail_version: str | None = None,
         model_id: str | None = None,
     ) -> str:
-        """Run a chat turn. `messages` is a list of {role, text}."""
-        if self.mock:
-            return _mock_answer(system_prompt, messages)
+        """Run a chat turn using Bedrock Converse API.
 
+        Args:
+            system_prompt: System context/instructions
+            messages: List of {role, text} dicts (role: "user" or "assistant")
+            guardrail_id: Optional Bedrock guardrail to apply
+            guardrail_version: Guardrail version (defaults to "DRAFT")
+            model_id: Model ID (defaults to config.bedrock_model_id)
+
+        Returns:
+            Assistant's text response
+        """
         model = model_id or self.settings.bedrock_model_id
         kwargs = {
             "modelId": model,
@@ -64,9 +66,20 @@ class BedrockClient:
 
     # --------------------------------------------------------------- KB (RAG)
     def retrieve(self, kb_id: str | None, query: str, top_k: int = 3) -> list[str]:
-        """Return the top relevant text chunks for a query."""
-        if self.mock or not kb_id:
-            return _mock_chunks(query)
+        """Retrieve top relevant text chunks from Bedrock Knowledge Base.
+
+        Args:
+            kb_id: Knowledge Base ID
+            query: Search query
+            top_k: Number of results to return
+
+        Returns:
+            List of text chunks
+        """
+        if not kb_id:
+            logger.warning("[bedrock] retrieve called with no KB ID")
+            return []
+
         resp = self._agent_runtime.retrieve(
             knowledgeBaseId=kb_id,
             retrievalQuery={"text": query},
@@ -75,24 +88,39 @@ class BedrockClient:
         return [r["content"]["text"] for r in resp.get("retrievalResults", [])]
 
     # ------------------------------------------------- guardrail (create ref)
-    def create_guardrail(self, name: str, denied_topics: list[str],
-                         blocked_phrases: list[str], pii: list[str]) -> dict:
-        """Create a Bedrock guardrail; returns {id, version}. Mock returns a
-        fake id so the pipeline is exercised end-to-end."""
-        if self.mock:
-            return {"id": f"mock-gr-{name}", "version": "DRAFT"}
+    def create_guardrail(
+        self,
+        name: str,
+        denied_topics: list[str],
+        blocked_phrases: list[str],
+        pii: list[str],
+    ) -> dict:
+        """Create a Bedrock guardrail.
 
-        topic_policy = {
-            "topicsConfig": [
-                {"name": t[:100], "definition": t, "type": "DENY"} for t in denied_topics
-            ]
-        } if denied_topics else None
-        word_policy = {
-            "wordsConfig": [{"text": p} for p in blocked_phrases]
-        } if blocked_phrases else None
-        sensitive = {
-            "piiEntitiesConfig": [{"type": p, "action": "BLOCK"} for p in pii]
-        } if pii else None
+        Args:
+            name: Guardrail name
+            denied_topics: Topics to deny
+            blocked_phrases: Phrases to block
+            pii: PII entity types to block (e.g., ["EMAIL", "PHONE"])
+
+        Returns:
+            dict with keys: id, version
+        """
+        topic_policy = (
+            {
+                "topicsConfig": [
+                    {"name": t[:100], "definition": t, "type": "DENY"} for t in denied_topics
+                ]
+            }
+            if denied_topics
+            else None
+        )
+        word_policy = {"wordsConfig": [{"text": p} for p in blocked_phrases]} if blocked_phrases else None
+        sensitive = (
+            {"piiEntitiesConfig": [{"type": p, "action": "BLOCK"} for p in pii]}
+            if pii
+            else None
+        )
 
         kwargs = {
             "name": name,
@@ -108,41 +136,6 @@ class BedrockClient:
 
         resp = self._control.create_guardrail(**kwargs)
         return {"id": resp["guardrailId"], "version": resp.get("version", "DRAFT")}
-
-
-# --------------------------------------------------------------------------
-# Mock helpers — realistic enough to demo before AWS is wired.
-# --------------------------------------------------------------------------
-def _mock_chunks(query: str) -> list[str]:
-    return [
-        f"[KB] Reference material relevant to: {query}",
-        "[KB] Policy excerpt describing the standard handling for this topic.",
-    ]
-
-
-def _mock_answer(system_prompt: str, messages: list[dict]) -> str:
-    """Produce a plausible generic-vs-adapted contrast. The adapted (context
-    pack) prompt is identifiable by its structured '## Role' header; the
-    generic prompt is plain."""
-    question = messages[-1]["text"] if messages else ""
-    adapted = "## Role" in system_prompt
-    if not adapted:
-        return (
-            f"Here's a general answer to \"{question}\". "
-            "This is a plain, non-specialised response with no industry context."
-        )
-    # Pull the role line to flavour the mock adapted answer.
-    role_line = ""
-    for line in system_prompt.splitlines():
-        if line.startswith("You are "):
-            role_line = line
-            break
-    return (
-        f"{role_line} Regarding \"{question}\": based on the loaded industry "
-        "context and relevant knowledge-base material, here is a precise, "
-        "policy-aware answer tailored to this industry, with escalation and "
-        "safety rules applied."
-    )
 
 
 _client: BedrockClient | None = None

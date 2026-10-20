@@ -46,11 +46,10 @@ class MetricsJsonFormatter(logging.Formatter):
 
 
 def get_logging_config():
-    """Return logging config dict based on environment (AWS vs local)."""
+    """Return logging config for AWS CloudWatch with JSON formatting."""
     s = get_settings()
-    is_aws = s.aws_region and not s.mock_mode
 
-    if is_aws:
+    if s.aws_region:
         return {
             "version": 1,
             "disable_existing_loggers": False,
@@ -73,26 +72,26 @@ def get_logging_config():
             },
         }
     else:
-        # Local: standard colored console logs
+        # Fallback when AWS region not configured
         return {
             "version": 1,
             "disable_existing_loggers": False,
             "formatters": {
-                "standard": {
-                    "format": "%(asctime)s [%(levelname)s] %(name)s: %(message)s"
+                "json": {
+                    "()": MetricsJsonFormatter,
                 }
             },
             "handlers": {
-                "default": {
+                "console": {
                     "class": "logging.StreamHandler",
-                    "formatter": "standard",
+                    "formatter": "json",
                     "stream": "ext://sys.stdout",
                 }
             },
-            "root": {"level": "WARNING", "handlers": ["default"]},
+            "root": {"level": "INFO", "handlers": ["console"]},
             "loggers": {
-                "uvicorn.access": {"level": "WARNING", "handlers": ["default"], "propagate": False},
-                "uvicorn.error": {"level": "ERROR", "handlers": ["default"], "propagate": False},
+                "uvicorn.access": {"level": "INFO", "handlers": ["console"], "propagate": False},
+                "uvicorn.error": {"level": "ERROR", "handlers": ["console"], "propagate": False},
             },
         }
 

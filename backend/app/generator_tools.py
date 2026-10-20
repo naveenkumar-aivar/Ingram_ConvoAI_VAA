@@ -70,9 +70,49 @@ def validate_pack(pack_json: str) -> str:
     return "OK" if not gaps else "GAPS: " + "; ".join(gaps)
 
 
+@tool
+def shape_guardrail_and_prompt(pack_json: str) -> str:
+    """Confirm the pack's guardrail content maps cleanly onto the Bedrock
+    guardrail policies (topic / word / sensitive-information). Call this ONCE
+    before finishing to verify guardrails are complete.
+
+    Checks guardrails.denied_topics, guardrails.blocked_phrases and
+    guardrails.pii_blocks are each present, non-empty and well-formed (lists of
+    strings/objects). Returns 'VALID: mapped topic=N word=M pii=K' when all
+    three are present, else 'INVALID: <missing/malformed fields>'."""
+    try:
+        p = json.loads(pack_json)
+    except Exception:  # noqa: BLE001
+        return "INVALID: pack_json is not valid JSON."
+
+    g = p.get("guardrails") or {}
+    problems: list[str] = []
+
+    def _well_formed_list(value) -> bool:
+        if not isinstance(value, list) or not value:
+            return False
+        return all(isinstance(item, (str, dict)) for item in value)
+
+    denied = g.get("denied_topics")
+    blocked = g.get("blocked_phrases")
+    pii = g.get("pii_blocks")
+
+    if not _well_formed_list(denied):
+        problems.append("guardrails.denied_topics missing or malformed")
+    if not _well_formed_list(blocked):
+        problems.append("guardrails.blocked_phrases missing or malformed")
+    if not _well_formed_list(pii):
+        problems.append("guardrails.pii_blocks missing or malformed")
+
+    if problems:
+        return "INVALID: " + "; ".join(problems)
+
+    return f"VALID: mapped topic={len(denied)} word={len(blocked)} pii={len(pii)}"
+
+
 # The tool list the agent is given.
 # NOTE: web_search was removed — it was a no-op stub that returned placeholder
 # text, so the agent wasted tokens calling it and often hit the max_tokens
 # truncation (which triggered the deterministic fallback). The model already
 # has strong industry knowledge; it grounds packs from that directly.
-GENERATOR_TOOLS = [list_existing_pieces, get_existing_piece, validate_pack]
+GENERATOR_TOOLS = [list_existing_pieces, get_existing_piece, validate_pack, shape_guardrail_and_prompt]

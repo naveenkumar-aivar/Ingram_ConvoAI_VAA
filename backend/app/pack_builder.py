@@ -7,9 +7,8 @@ prompts, guardrails, handoff) for that industry and reuses them, generating
 only what's missing and layering the user's additional details on top. This is
 the "don't build the wheel again" rule.
 
-Generation provider follows LLM_PROVIDER (Amazon Bedrock). If the LLM is
-unavailable it falls back to sensible deterministic defaults so the flow
-never breaks.
+Generation uses Amazon Bedrock via Strands. If unavailable it falls back to
+sensible deterministic defaults so the flow never breaks.
 
 Entry point: build_pack(request) -> (ContextPack, BuildReport)
 The result is NOT persisted here — the caller stores it as a draft and only
@@ -18,6 +17,8 @@ commits on human approval.
 from __future__ import annotations
 
 import json
+import logging
+import re
 from dataclasses import dataclass, field
 
 from app.config import get_settings
@@ -32,6 +33,8 @@ from app.models import (
     Persona,
     Scope,
 )
+
+logger = logging.getLogger(__name__)
 
 STAGES = [
     "Checking for reusable pieces",
@@ -70,8 +73,7 @@ class BuildReport:
 # Public entry point
 # ---------------------------------------------------------------------------
 def build_pack(inp: BuildInput) -> tuple[ContextPack, BuildReport]:
-    settings = get_settings()
-    report = BuildReport(provider=settings.llm_provider)
+    report = BuildReport(provider="bedrock")
     industry = inp.industry.strip() or "General"
     name = (inp.name or industry.lower().replace(" ", "-")).strip()
 
@@ -149,7 +151,36 @@ def _resolve_ontology(inp: BuildInput, existing: dict, report: BuildReport) -> l
     )
     if data and data.get("terms"):
         return [OntologyEntry(**_only(t, OntologyEntry)) for t in data["terms"]]
-    return [OntologyEntry(term=inp.industry, definition=f"The {inp.industry} domain.", core=True)]
+    # No-LLM fallback: a small, generic-but-useful default ontology (<= 6 entries).
+    # We deliberately avoid fabricating industry-specific regulatory terms here —
+    # those could be wrong without an LLM — and keep the extra terms generic/safe.
+    return [
+        OntologyEntry(
+            term=inp.industry,
+            definition=f"The {inp.industry} domain this assistant serves.",
+            core=True,
+        ),
+        OntologyEntry(
+            term="Scope",
+            definition="The set of topics this assistant is allowed to handle.",
+            core=False,
+        ),
+        OntologyEntry(
+            term="Escalation",
+            definition="Routing a request to a human team when it is out of scope, urgent, or high-risk.",
+            core=False,
+        ),
+        OntologyEntry(
+            term="Guardrail",
+            definition="A safety rule the assistant must never violate.",
+            core=False,
+        ),
+        OntologyEntry(
+            term="Knowledge Base",
+            definition="The approved source documents the assistant grounds its answers in.",
+            core=False,
+        ),
+    ]
 
 
 def _resolve_prompts(inp: BuildInput, existing: dict, report: BuildReport) -> list[str]:
@@ -223,24 +254,118 @@ def _resolve_guardrails(inp: BuildInput, existing: dict, report: BuildReport) ->
     )
     base = existing.get("guardrails") or {}
     if data:
+        # LLM success path. Harden it so the user's guardrail intent is never
+        # dropped: if the model returned empty denied_topics/pii_blocks but the
+        # user DID provide guardrail notes, derive those deterministically.
         return Guardrails(
             safety_rules=data.get("safety_rules", []) or _user_safety(inp),
-            denied_topics=data.get("denied_topics", []),
+            denied_topics=data.get("denied_topics") or _derive_denied_topics(_user_safety(inp)),
             blocked_phrases=data.get("blocked_phrases", []),
-            pii_blocks=data.get("pii_blocks") or base.get("pii_blocks", ["SSN", "EMAIL", "PHONE"]),
+            pii_blocks=data.get("pii_blocks") or _derive_pii_blocks(
+                inp.industry, _user_safety(inp), base.get("pii_blocks", [])
+            ),
         )
-    # Fallback: turn the user's notes into safety rules directly.
+    # Fallback (LLM unavailable, e.g. expired AWS token): build STRONG guardrails
+    # from the user's own safety notes rather than a PII-only policy.
+    safety = _user_safety(inp)
     return Guardrails(
-        safety_rules=_user_safety(inp),
-        denied_topics=[],
+        safety_rules=safety or [
+            f"Only assist with {inp.industry} topics; refuse anything outside scope and route to a human."
+        ],
+        denied_topics=_derive_denied_topics(safety),
+        # Leave blocked_phrases empty in the fallback (hard to infer safely);
+        # the real LLM path is responsible for filling these.
         blocked_phrases=[],
-        pii_blocks=base.get("pii_blocks", ["SSN", "EMAIL", "PHONE"]),
+        pii_blocks=_derive_pii_blocks(inp.industry, safety, base.get("pii_blocks", [])),
     )
 
 
 def _user_safety(inp: BuildInput) -> list[str]:
     """User's free-text guardrail notes become explicit safety rules verbatim."""
     return _lines(inp.guardrails)
+
+
+# Leading imperative prefixes that turn a safety rule ("No X", "Never X") into a
+# plain topic label ("X"). Order matters — longer/more specific first.
+_DENY_PREFIX_RE = re.compile(
+    r"^(?:please\s+)?(?:do\s+not|don'?t|never|avoid|no)\b[\s:,-]*",
+    re.IGNORECASE,
+)
+
+
+def _derive_denied_topics(safety_lines: list[str]) -> list[str]:
+    """Turn each user safety rule into a SHORT denied-topic label (<= 60 chars).
+
+    Heuristic, defensive, and never raises: strip a leading imperative
+    ("No ", "Never ", "Do not ", ...), cut the label at the first clause
+    boundary (" — ", "—", ":", ".", " to ", " that ") so we keep the meaningful
+    noun phrase, trim trailing punctuation, and cap the length. Results are
+    deduplicated case-insensitively while preserving order and capped to ~10.
+    """
+    out: list[str] = []
+    seen: set[str] = set()
+    for raw in safety_lines or []:
+        try:
+            label = (raw or "").strip()
+            if not label:
+                continue
+            # Drop the leading imperative ("No ", "Never ", "Do not ", ...).
+            label = _DENY_PREFIX_RE.sub("", label, count=1).strip()
+            # Cut at the first clause boundary so we keep the core noun phrase.
+            for sep in (" — ", "—", ":", " to ", " that "):
+                idx = label.find(sep)
+                if idx > 0:
+                    label = label[:idx]
+            # Drop a trailing sentence period but keep internal punctuation.
+            label = label.rstrip(" .;,").strip()
+            if not label:
+                continue
+            # Capitalise the first character for a readable label.
+            label = label[0].upper() + label[1:]
+            # Keep labels short, but trim on a word boundary so we never cut a
+            # word in half (and give a little headroom for a complete phrase).
+            if len(label) > 70:
+                cut = label[:70]
+                sp = cut.rfind(" ")
+                label = (cut[:sp] if sp > 0 else cut).rstrip(" .;,")
+        except Exception:  # noqa: BLE001 — never let label-building break the build
+            continue
+        key = label.lower()
+        if label and key not in seen:
+            seen.add(key)
+            out.append(label)
+    return out[:10]
+
+
+# PII tokens we know how to map downstream (bedrock_resources._PII_MAP).
+_KNOWN_PII = {"SSN", "EMAIL", "PHONE", "CREDIT_CARD", "NAME", "ADDRESS"}
+_HEALTH_HINT_RE = re.compile(r"health|phi|medical|patient", re.IGNORECASE)
+_HEALTH_INDUSTRY_RE = re.compile(r"health|hospital|clinic|medical", re.IGNORECASE)
+
+
+def _derive_pii_blocks(industry: str, safety_lines: list[str], base_pii: list[str]) -> list[str]:
+    """Return a sensible PII set for the fallback guardrail.
+
+    Starts from base_pii (if any) else the standard SSN/EMAIL/PHONE. In a health
+    context — any safety line mentioning health/PHI/medical/patient, or an
+    industry name containing health/hospital/clinic/medical — names and
+    addresses are also protected. Unknown tokens are dropped; the result is
+    deduplicated with order preserved.
+    """
+    tokens: list[str] = list(base_pii) or ["SSN", "EMAIL", "PHONE"]
+    health = bool(_HEALTH_INDUSTRY_RE.search(industry or "")) or any(
+        _HEALTH_HINT_RE.search(line or "") for line in (safety_lines or [])
+    )
+    if health:
+        tokens += ["NAME", "ADDRESS"]
+    out: list[str] = []
+    seen: set[str] = set()
+    for tok in tokens:
+        up = (tok or "").strip().upper()
+        if up in _KNOWN_PII and up not in seen:
+            seen.add(up)
+            out.append(up)
+    return out
 
 
 def _build_scope(industry: str, use_case: str) -> Scope:
@@ -263,16 +388,14 @@ def _build_scope(industry: str, use_case: str) -> Scope:
 # LLM helper (Amazon Bedrock) with graceful fallback
 # ---------------------------------------------------------------------------
 def _llm_json(instruction: str, inp: BuildInput) -> dict | None:
-    """Ask the configured LLM for a JSON object. Returns None on any failure
+    """Ask Bedrock for a JSON object via Strands. Returns None on any failure
     (caller falls back to defaults). Skipped entirely when dynamic=False."""
     if not inp.dynamic:
         return None
-    provider = get_settings().llm_provider.lower()
     try:
-        if provider == "bedrock":
-            return _bedrock_json(instruction)
+        return _bedrock_json(instruction)
     except Exception as exc:  # noqa: BLE001
-        print(f"[pack_builder] LLM generation failed ({provider}): {exc}")
+        logger.warning(f"[pack_builder] Bedrock generation failed: {exc}")
     return None
 
 

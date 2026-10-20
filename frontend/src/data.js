@@ -32,8 +32,15 @@ export async function listIndustries() {
   return get('/industries')
 }
 
-export async function listVersions(industry) {
-  return get(`/context-packs?industry=${encodeURIComponent(industry)}`)
+export async function listVersions(industry, agentName = '') {
+  const url = agentName
+    ? `/context-packs?industry=${encodeURIComponent(industry)}&agent_name=${encodeURIComponent(agentName)}`
+    : `/context-packs?industry=${encodeURIComponent(industry)}`
+  return get(url)
+}
+
+export async function listAgentNames(industry) {
+  return get(`/agent-names?industry=${encodeURIComponent(industry)}`)
 }
 
 export async function getPack(packId) {
@@ -91,8 +98,73 @@ export async function generateDraft(form) {
   return post('/context-packs/generate', formToBody(form))
 }
 
-export async function approveDraft(draftId) {
-  return post(`/context-packs/${encodeURIComponent(draftId)}/approve`, {})
+// Update the stored draft with edited pack content and re-run validation.
+// Returns { pack, system_prompt, gaps } where gaps is "OK" or "GAPS: a; b; c".
+export async function updateDraft(draftId, pack) {
+  const r = await fetch(`${API}/context-packs/${encodeURIComponent(draftId)}/draft`, {
+    method: 'PUT',
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify({ pack }),
+  })
+  if (!r.ok) throw new Error(`PUT draft -> ${r.status}`)
+  return r.json()
+}
+
+// Approve a draft and consume the Server-Sent Events progress stream.
+// Opens a POST request and reads the body incrementally (EventSource is
+// GET-only). Each `data: {...}` frame is parsed and passed to onEvent(obj).
+// Resolves with the terminal {step:'done', ...} event. Throws on a
+// mid-stream disconnect so the UI can surface an error.
+export async function approveDraftStream(draftId, onEvent) {
+  const url = `${API}/context-packs/${encodeURIComponent(draftId)}/approve`
+  const r = await fetch(url, {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json' },
+    body: '{}',
+  })
+  if (!r.ok || !r.body) throw new Error(`approve -> ${r.status}`)
+
+  const reader = r.body.getReader()
+  const decoder = new TextDecoder()
+  let buffer = ''
+  let done = null
+
+  const dispatch = (raw) => {
+    const frame = raw.trim()
+    if (!frame) return
+    // A frame may have multiple lines; keep only the data: payload lines.
+    const payload = frame
+      .split('\n')
+      .map((l) => l.replace(/^data:\s?/, ''))
+      .join('')
+      .trim()
+    if (!payload) return
+    let obj
+    try { obj = JSON.parse(payload) } catch { return }
+    onEvent?.(obj)
+    if (obj.step === 'done') done = obj
+  }
+
+  while (true) {
+    const { value, done: streamDone } = await reader.read()
+    if (value) buffer += decoder.decode(value, { stream: true })
+
+    let sep
+    while ((sep = buffer.indexOf('\n\n')) !== -1) {
+      const chunk = buffer.slice(0, sep)
+      buffer = buffer.slice(sep + 2)
+      dispatch(chunk)
+    }
+
+    if (streamDone) {
+      // Flush any trailing frame that was not terminated by a blank line.
+      if (buffer.trim()) dispatch(buffer)
+      break
+    }
+  }
+
+  if (!done) throw new Error('approval stream ended without a terminal event')
+  return done
 }
 
 export async function rejectDraft(draftId) {
@@ -144,5 +216,6 @@ function normalizePack(p) {
     escalations: (p.escalation_rules ?? []).map((e) => ({
       trigger: e.trigger, to: e.escalate_to ?? e.to, priority: e.priority ?? 'Medium',
     })),
+    useCase: p.use_case ?? '',
   }
 }

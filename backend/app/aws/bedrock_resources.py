@@ -1,23 +1,36 @@
-"""Bedrock Resources Management
+"""Bedrock Resources Management.
 
-Handles creation and management of Bedrock Guardrails and Prompt Templates
-from stored context pack pieces in S3.
+Creates REAL Amazon Bedrock resources that reflect an approved ContextPack:
 
-Workflow:
-  1. Load guardrails + prompts pieces from S3
-  2. Create Bedrock guardrail (denied topics, blocked phrases, PII detection)
-  3. Create Bedrock prompt template (system prompt)
-  4. Update context pack with resource IDs
-  5. Persist updated pack to S3
+  * a Bedrock Guardrail whose topic / word / sensitive-information policies are
+    mapped directly from the pack's guardrails (denied_topics, blocked_phrases,
+    pii_blocks) — the pack is the single source of truth, no separate pieces;
+  * a Bedrock Prompt Management resource built from the pack's composed system
+    prompt (pack.to_system_prompt()).
+
+All guardrail content is derived EXCLUSIVELY from the ContextPack passed in.
+
+The guardrail is created in DRAFT state and then a numbered, usable version is
+produced via create_guardrail_version. The prompt is created and then versioned
+via create_prompt_version.
+
+Public surface (kept stable so imports do not break):
+  * class BedrockResourceManager
+  * get_bedrock_manager()
+  * exceptions BedrockResourcesError / GuardrailCreationError / PromptTemplateError
 """
 
-import json
+from __future__ import annotations
+
 import logging
+import re
 from datetime import datetime
-from typing import Optional, Dict, Any
+from typing import Any, Dict, Optional
 
 import boto3
-from botocore.exceptions import ClientError, BotoCoreError
+from botocore.exceptions import ClientError
+
+from app.config import get_settings
 
 logger = logging.getLogger(__name__)
 
@@ -33,427 +46,226 @@ class GuardrailCreationError(BedrockResourcesError):
 
 
 class PromptTemplateError(BedrockResourcesError):
-    """Raised when prompt template creation fails."""
+    """Raised when prompt-management resource creation fails."""
     pass
 
 
+# PII token (as used in ContextPack.guardrails.pii_blocks) -> Bedrock PII entity type.
+_PII_MAP = {
+    "SSN": "US_SOCIAL_SECURITY_NUMBER",
+    "EMAIL": "EMAIL",
+    "PHONE": "PHONE",
+    "CREDIT_CARD": "CREDIT_DEBIT_CARD_NUMBER",
+    "NAME": "NAME",
+    "ADDRESS": "ADDRESS",
+}
+
+# Bedrock topic names must match [0-9a-zA-Z-_ !?.]+ and be reasonably short.
+_TOPIC_NAME_RE = re.compile(r"[^0-9a-zA-Z\-_ !?.]")
+
+_DEFAULT_MESSAGING = "I can't help with that request."
+
+
+def _topic_name(text: str, idx: int) -> str:
+    """Derive a short, valid guardrail topic name from denied-topic text."""
+    cleaned = _TOPIC_NAME_RE.sub(" ", (text or "").strip())
+    cleaned = re.sub(r"\s+", " ", cleaned).strip()
+    if not cleaned:
+        cleaned = f"topic-{idx + 1}"
+    return cleaned[:100]
+
+
+def _assistant_slug(pack: Any) -> str:
+    """Derive a short assistant-name slug from pack.meta.pack_id.
+
+    Pack ids look like '<name>-vN'; the trailing '-vN' is stripped to recover
+    the assistant '<name>'. Falls back to 'assistant' when unavailable.
+    """
+    pid = ""
+    try:
+        pid = (pack.meta.pack_id or "").strip().lower()
+    except Exception:  # noqa: BLE001 — defensive, pack_id should always exist
+        pid = ""
+    base = re.sub(r"-v\d+$", "", pid) if pid else ""
+    base = re.sub(r"[^0-9a-z\-]", "-", base).strip("-")
+    return base or "assistant"
+
+
+def _safe_name(industry: str, assistant: str, timestamp: str, max_len: int) -> str:
+    """Build a sanitized '<industry>-<assistant>-<timestamp>' name, truncated to
+    `max_len` chars while preserving the timestamp suffix so names stay unique.
+
+    The industry/assistant portion is trimmed as needed; the '-<timestamp>'
+    suffix is always kept intact.
+    """
+    industry = re.sub(r"[^0-9a-z\-]", "-", (industry or "").strip().lower()).strip("-") or "general"
+    assistant = re.sub(r"[^0-9a-z\-]", "-", (assistant or "").strip().lower()).strip("-") or "assistant"
+    suffix = f"-{timestamp}"
+    # Budget for the industry/assistant part (keep the timestamp suffix whole).
+    head_budget = max(1, max_len - len(suffix))
+    head = f"{industry}-{assistant}"[:head_budget].rstrip("-")
+    name = f"{head}{suffix}"
+    return name[:max_len]
+
+
 class BedrockResourceManager:
-    """Manages Bedrock guardrails and prompt templates."""
+    """Manages Bedrock guardrails and prompt-management resources."""
 
-    def __init__(self, region: str = "us-east-1"):
-        """Initialize Bedrock client.
-
-        Args:
-            region: AWS region for Bedrock service.
-        """
+    def __init__(self, region: str):
         self.region = region
+        # Control-plane clients.
         self.bedrock_client = boto3.client("bedrock", region_name=region)
-        self.bedrock_runtime = boto3.client("bedrock-runtime", region_name=region)
+        self.bedrock_agent = boto3.client("bedrock-agent", region_name=region)
 
-    def create_guardrail(
-        self,
-        industry: str,
-        usecase: str,
-        guardrails_data: Dict[str, Any],
-        description: Optional[str] = None,
-    ) -> Dict[str, str]:
-        """Create a Bedrock guardrail from guardrails piece data.
+    # ------------------------------------------------------------------
+    # Guardrail
+    # ------------------------------------------------------------------
+    def create_guardrail_from_pack(self, pack: Any) -> Dict[str, str]:
+        """Create a Bedrock guardrail from the ContextPack's guardrails.
 
-        Args:
-            industry: Industry name (e.g., 'banking', 'healthcare')
-            usecase: Use case name (e.g., 'support', 'assist')
-            guardrails_data: Guardrails piece data with structure:
-                {
-                  "denied_topics": [{"name": "...", "definition": "..."}, ...],
-                  "blocked_phrases": ["phrase1", "phrase2", ...],
-                  "pii_detection": {
-                    "email": true,
-                    "phone": true,
-                    "ssn": true,
-                    "credit_card": true
-                  }
-                }
-            description: Optional description for the guardrail.
+        `pack` is a ContextPack (pydantic) instance. Guardrail content is taken
+        ONLY from pack.meta + pack.guardrails. Returns {id, version, arn}.
 
-        Returns:
-            Dict with keys:
-              - id: Guardrail ID
-              - version: Guardrail version
-              - arn: Guardrail ARN
-              - created_at: Creation timestamp
-
-        Raises:
-            GuardrailCreationError: If guardrail creation fails.
+        Raises GuardrailCreationError on AWS failure.
         """
+        g = pack.guardrails
+        industry = (pack.meta.industry or "general").strip().lower().replace(" ", "-") or "general"
+        assistant = _assistant_slug(pack)
+        timestamp = datetime.utcnow().strftime("%m%d%H%M%S")
+        # Guardrail name must be <= 50 chars; description must be <= 200 chars.
+        name = _safe_name(industry, assistant, timestamp, max_len=50)
+        description = f"VAA guardrail for {industry}/{assistant}"[:200]
+
+        denied_topics = [t for t in (g.denied_topics or []) if isinstance(t, str) and t.strip()]
+        blocked_phrases = [p for p in (g.blocked_phrases or []) if isinstance(p, str) and p.strip()]
+        pii_blocks = [p for p in (g.pii_blocks or []) if isinstance(p, str) and p.strip()]
+
+        kwargs: Dict[str, Any] = {
+            "name": name,
+            "description": description,
+            "blockedInputMessaging": _DEFAULT_MESSAGING,
+            "blockedOutputsMessaging": _DEFAULT_MESSAGING,
+        }
+
+        # Topic policy — one entry per denied topic.
+        if denied_topics:
+            kwargs["topicPolicyConfig"] = {
+                "topicsConfig": [
+                    {
+                        "name": _topic_name(topic, idx),
+                        "definition": topic.strip(),
+                        "type": "DENY",
+                    }
+                    for idx, topic in enumerate(denied_topics)
+                ]
+            }
+
+        # Word policy — one entry per blocked phrase. Omit entirely if empty.
+        if blocked_phrases:
+            kwargs["wordPolicyConfig"] = {
+                "wordsConfig": [{"text": phrase.strip()} for phrase in blocked_phrases]
+            }
+
+        # Sensitive-information policy — map known PII tokens, skip unknown.
+        pii_entities = []
+        for token in pii_blocks:
+            mapped = _PII_MAP.get(token.strip().upper())
+            if mapped:
+                pii_entities.append({"type": mapped, "action": "BLOCK"})
+        if pii_entities:
+            kwargs["sensitiveInformationPolicyConfig"] = {"piiEntitiesConfig": pii_entities}
+
         try:
-            # Build guardrail name (must be unique, include timestamp)
-            timestamp = datetime.utcnow().strftime("%Y%m%d%H%M%S")
-            guardrail_name = f"{industry}-{usecase}-guardrail-{timestamp}"
-
-            # Default description if not provided
-            if not description:
-                description = f"Guardrail for {industry}/{usecase} context pack"
-
-            # Build topic config (denied topics)
-            topic_configs = []
-            for topic in guardrails_data.get("denied_topics", []):
-                topic_configs.append(
-                    {
-                        "name": topic.get("name", "unknown"),
-                        "definition": topic.get(
-                            "definition", "Topic to be denied"
-                        ),
-                        "examples": topic.get("examples", []),
-                    }
-                )
-
-            # Build content policy (blocked phrases and PII)
-            content_policy_config = {
-                "filters": [],
-                "contextualGroundingFilterEnabled": True,
-            }
-
-            # Add blocked phrases filter
-            if guardrails_data.get("blocked_phrases"):
-                content_policy_config["filters"].append(
-                    {
-                        "type": "PROFANITY",
-                        "strength": "HIGH",
-                        "regexFilter": {
-                            "pattern": "|".join(
-                                guardrails_data.get("blocked_phrases", [])
-                            )
-                        },
-                    }
-                )
-
-            # Add PII filter
-            pii_config = guardrails_data.get("pii_detection", {})
-            if pii_config:
-                pii_entities = []
-                if pii_config.get("email"):
-                    pii_entities.append("EMAIL")
-                if pii_config.get("phone"):
-                    pii_entities.append("PHONE")
-                if pii_config.get("ssn"):
-                    pii_entities.append("SSN")
-                if pii_config.get("credit_card"):
-                    pii_entities.append("CREDIT_CARD_NUMBER")
-
-                if pii_entities:
-                    content_policy_config["filters"].append(
-                        {
-                            "type": "PII",
-                            "strength": "MEDIUM",
-                            "piiEntities": pii_entities,
-                        }
-                    )
-
-            # Create guardrail
-            logger.info(
-                f"[bedrock] Creating guardrail: {guardrail_name} for {industry}/{usecase}"
-            )
-            response = self.bedrock_client.create_guardrail(
-                name=guardrail_name,
-                description=description,
-                topicPolicyConfig={"topicsConfig": topic_configs}
-                if topic_configs
-                else None,
-                contentPolicyConfig=content_policy_config
-                if content_policy_config["filters"]
-                else None,
-                tags={
-                    "Industry": industry,
-                    "UseCase": usecase,
-                    "ManagedBy": "VerticalAdaptationAgent",
-                },
-            )
-
-            guardrail_id = response["guardrailId"]
-            guardrail_version = response["version"]
-            guardrail_arn = response.get("guardrailArn", "")
-
-            logger.info(
-                f"[bedrock] Guardrail created: {guardrail_id} (v{guardrail_version})"
-            )
-
-            return {
-                "id": guardrail_id,
-                "version": guardrail_version,
-                "arn": guardrail_arn,
-                "name": guardrail_name,
-                "created_at": datetime.utcnow().isoformat(),
-            }
-
+            logger.info(f"[bedrock] Creating guardrail {name}")
+            resp = self.bedrock_client.create_guardrail(**kwargs)
+            guardrail_id = resp["guardrailId"]
+            guardrail_arn = resp.get("guardrailArn", "")
         except ClientError as e:
-            error_code = e.response["Error"]["Code"]
-            error_msg = e.response["Error"]["Message"]
-            logger.error(
-                f"[bedrock] Guardrail creation failed: {error_code} - {error_msg}"
-            )
-            raise GuardrailCreationError(
-                f"Failed to create guardrail for {industry}/{usecase}: {error_msg}"
-            ) from e
-        except (BotoCoreError, Exception) as e:
-            logger.error(f"[bedrock] Unexpected error creating guardrail: {e}")
-            raise GuardrailCreationError(
-                f"Unexpected error creating guardrail: {str(e)}"
-            ) from e
+            msg = e.response.get("Error", {}).get("Message", str(e))
+            logger.error(f"[bedrock] Guardrail creation failed: {msg}")
+            raise GuardrailCreationError(f"Guardrail creation failed: {msg}") from e
 
-    def create_prompt_template(
-        self,
-        industry: str,
-        usecase: str,
-        prompts_data: Dict[str, Any],
-        model_id: str = "us.anthropic.claude-haiku-4-5-20251001-v1:0",
-    ) -> Dict[str, str]:
-        """Create a Bedrock prompt template from prompts piece data.
-
-        Note: Bedrock doesn't have a dedicated "prompt template" service like some
-        other platforms. Instead, we store the template in a custom way and reference
-        it. This function creates a record that can be used when calling InvokeModel.
-
-        Args:
-            industry: Industry name
-            usecase: Use case name
-            prompts_data: Prompts piece data with structure:
-                {
-                  "system_prompt_lines": ["line1", "line2", ...],
-                  "temperature": 0.7,  # optional
-                  "max_tokens": 1024   # optional
-                }
-            model_id: Model ID to use with this template.
-
-        Returns:
-            Dict with keys:
-              - id: Template ID (generated)
-              - name: Template name
-              - system_prompt: Full system prompt text
-              - model_id: Model ID
-              - temperature: Temperature setting
-              - max_tokens: Max tokens setting
-              - created_at: Creation timestamp
-        """
+        # Produce a numbered, usable version from the DRAFT guardrail.
+        version = "DRAFT"
         try:
-            timestamp = datetime.utcnow().strftime("%Y%m%d%H%M%S")
-            template_id = f"{industry}-{usecase}-prompt-{timestamp}"
-            template_name = f"{industry}/{usecase} Prompt Template"
-
-            # Build system prompt from lines
-            system_prompt_lines = prompts_data.get("system_prompt_lines", [])
-            system_prompt = "\n".join(system_prompt_lines) if system_prompt_lines else ""
-
-            # Get optional parameters
-            temperature = prompts_data.get("temperature", 0.7)
-            max_tokens = prompts_data.get("max_tokens", 1024)
-
-            logger.info(
-                f"[bedrock] Created prompt template: {template_id} for {industry}/{usecase}"
+            vresp = self.bedrock_client.create_guardrail_version(
+                guardrailIdentifier=guardrail_id,
+                description=f"Version for {name}",
             )
+            version = str(vresp.get("version", "DRAFT"))
+        except ClientError as e:
+            msg = e.response.get("Error", {}).get("Message", str(e))
+            logger.warning(f"[bedrock] create_guardrail_version failed, using DRAFT: {msg}")
 
-            return {
-                "id": template_id,
-                "name": template_name,
-                "system_prompt": system_prompt,
-                "model_id": model_id,
-                "temperature": temperature,
-                "max_tokens": max_tokens,
-                "created_at": datetime.utcnow().isoformat(),
-            }
+        logger.info(f"[bedrock] Guardrail created: {guardrail_id} (v{version})")
+        return {"id": guardrail_id, "version": version, "arn": guardrail_arn}
 
-        except Exception as e:
-            logger.error(f"[bedrock] Error creating prompt template: {e}")
-            raise PromptTemplateError(
-                f"Failed to create prompt template for {industry}/{usecase}: {str(e)}"
-            ) from e
+    # ------------------------------------------------------------------
+    # Prompt Management
+    # ------------------------------------------------------------------
+    def create_prompt_from_pack(self, pack: Any) -> Dict[str, str]:
+        """Create a Bedrock Prompt Management resource from the pack's composed
+        system prompt. Returns {id, arn, version}.
 
-    def sync_guardrail_to_pack(
-        self,
-        industry: str,
-        usecase: str,
-        pack_data: Dict[str, Any],
-        guardrails_piece: Dict[str, Any],
-    ) -> Dict[str, Any]:
-        """Create Bedrock guardrail and update pack with its ID.
-
-        Args:
-            industry: Industry name
-            usecase: Use case name
-            pack_data: Context pack data
-            guardrails_piece: Guardrails piece from S3
-
-        Returns:
-            Updated pack_data with guardrail_id in integrations.
-
-        Raises:
-            GuardrailCreationError: If creation fails.
+        Raises PromptTemplateError on AWS failure.
         """
-        try:
-            guardrail_response = self.create_guardrail(
-                industry, usecase, guardrails_piece
-            )
+        settings = get_settings()
+        industry = (pack.meta.industry or "general").strip().lower().replace(" ", "-") or "general"
+        assistant = _assistant_slug(pack)
+        timestamp = datetime.utcnow().strftime("%m%d%H%M%S")
+        # Prompt name kept <= 100 chars; description must be <= 200 chars.
+        name = _safe_name(industry, assistant, timestamp, max_len=100)
+        description = f"VAA prompt for {industry}/{assistant}"[:200]
 
-            # Update pack integrations
-            if "integrations" not in pack_data:
-                pack_data["integrations"] = {}
-
-            pack_data["integrations"]["guardrail_id"] = guardrail_response["id"]
-            pack_data["integrations"]["guardrail_version"] = guardrail_response[
-                "version"
-            ]
-            pack_data["integrations"]["guardrail_arn"] = guardrail_response["arn"]
-            pack_data["integrations"]["guardrail_created_at"] = guardrail_response[
-                "created_at"
-            ]
-
-            logger.info(
-                f"[bedrock] Pack updated with guardrail: {guardrail_response['id']}"
-            )
-            return pack_data
-
-        except GuardrailCreationError:
-            raise
-        except Exception as e:
-            logger.error(f"[bedrock] Error syncing guardrail to pack: {e}")
-            raise
-
-    def sync_prompt_to_pack(
-        self,
-        industry: str,
-        usecase: str,
-        pack_data: Dict[str, Any],
-        prompts_piece: Dict[str, Any],
-        model_id: str = "us.anthropic.claude-haiku-4-5-20251001-v1:0",
-    ) -> Dict[str, Any]:
-        """Create Bedrock prompt template and update pack with its ID.
-
-        Args:
-            industry: Industry name
-            usecase: Use case name
-            pack_data: Context pack data
-            prompts_piece: Prompts piece from S3
-            model_id: Model ID to associate with template
-
-        Returns:
-            Updated pack_data with prompt_template_id in integrations.
-
-        Raises:
-            PromptTemplateError: If creation fails.
-        """
-        try:
-            prompt_response = self.create_prompt_template(
-                industry, usecase, prompts_piece, model_id
-            )
-
-            # Update pack integrations
-            if "integrations" not in pack_data:
-                pack_data["integrations"] = {}
-
-            pack_data["integrations"]["prompt_template_id"] = prompt_response["id"]
-            pack_data["integrations"]["prompt_template_name"] = prompt_response[
-                "name"
-            ]
-            pack_data["integrations"]["prompt_system_prompt"] = prompt_response[
-                "system_prompt"
-            ]
-            pack_data["integrations"]["prompt_model_id"] = prompt_response[
-                "model_id"
-            ]
-            pack_data["integrations"]["prompt_temperature"] = prompt_response[
-                "temperature"
-            ]
-            pack_data["integrations"]["prompt_max_tokens"] = prompt_response[
-                "max_tokens"
-            ]
-            pack_data["integrations"]["prompt_created_at"] = prompt_response[
-                "created_at"
-            ]
-
-            logger.info(
-                f"[bedrock] Pack updated with prompt template: {prompt_response['id']}"
-            )
-            return pack_data
-
-        except PromptTemplateError:
-            raise
-        except Exception as e:
-            logger.error(f"[bedrock] Error syncing prompt to pack: {e}")
-            raise
-
-    def sync_to_pack(
-        self,
-        industry: str,
-        usecase: str,
-        pack_data: Dict[str, Any],
-        guardrails_piece: Optional[Dict[str, Any]] = None,
-        prompts_piece: Optional[Dict[str, Any]] = None,
-    ) -> Dict[str, Any]:
-        """Create Bedrock guardrail + prompt template and update pack.
-
-        This is the main entry point. It orchestrates:
-          1. Creating guardrail from guardrails_piece
-          2. Creating prompt template from prompts_piece
-          3. Updating pack with both IDs
-
-        Args:
-            industry: Industry name
-            usecase: Use case name
-            pack_data: Context pack data (will be modified in place)
-            guardrails_piece: Guardrails piece data (if None, skipped)
-            prompts_piece: Prompts piece data (if None, skipped)
-
-        Returns:
-            Updated pack_data with both resource IDs in integrations.
-
-        Raises:
-            GuardrailCreationError: If guardrail creation fails.
-            PromptTemplateError: If prompt template creation fails.
-        """
-        logger.info(
-            f"[bedrock] Syncing resources to pack {industry}/{usecase}"
-        )
+        system_prompt = pack.to_system_prompt()
 
         try:
-            # Create guardrail if piece provided
-            if guardrails_piece:
-                pack_data = self.sync_guardrail_to_pack(
-                    industry, usecase, pack_data, guardrails_piece
-                )
-
-            # Create prompt template if piece provided
-            if prompts_piece:
-                pack_data = self.sync_prompt_to_pack(
-                    industry, usecase, pack_data, prompts_piece
-                )
-
-            logger.info(
-                f"[bedrock] Pack sync complete for {industry}/{usecase}"
+            logger.info(f"[bedrock] Creating prompt {name}")
+            resp = self.bedrock_agent.create_prompt(
+                name=name,
+                description=description,
+                variants=[
+                    {
+                        "name": "default",
+                        "templateType": "TEXT",
+                        "templateConfiguration": {"text": {"text": system_prompt}},
+                        "modelId": settings.bedrock_model_id,
+                    }
+                ],
             )
-            return pack_data
+            prompt_id = resp["id"]
+            prompt_arn = resp.get("arn", "")
+        except ClientError as e:
+            msg = e.response.get("Error", {}).get("Message", str(e))
+            logger.error(f"[bedrock] Prompt creation failed: {msg}")
+            raise PromptTemplateError(f"Prompt creation failed: {msg}") from e
 
-        except (GuardrailCreationError, PromptTemplateError):
-            raise
-        except Exception as e:
-            logger.error(f"[bedrock] Unexpected error during pack sync: {e}")
-            raise BedrockResourcesError(
-                f"Failed to sync resources to pack: {str(e)}"
-            ) from e
+        # Produce a numbered version; keep the draft prompt if versioning fails.
+        version = "DRAFT"
+        try:
+            vresp = self.bedrock_agent.create_prompt_version(
+                promptIdentifier=prompt_id,
+                description=f"Version for {name}",
+            )
+            version = str(vresp.get("version", "DRAFT"))
+            prompt_arn = vresp.get("arn", prompt_arn)
+        except ClientError as e:
+            msg = e.response.get("Error", {}).get("Message", str(e))
+            logger.warning(f"[bedrock] create_prompt_version failed, using draft: {msg}")
 
+        logger.info(f"[bedrock] Prompt created: {prompt_id} (v{version})")
+        return {"id": prompt_id, "arn": prompt_arn, "version": version}
 
-# Singleton instance
+# Singleton instance.
 _manager: Optional[BedrockResourceManager] = None
 
 
-def get_bedrock_manager(region: str = "us-east-1") -> BedrockResourceManager:
+def get_bedrock_manager(region: Optional[str] = None) -> BedrockResourceManager:
     """Get or create the Bedrock resource manager singleton.
 
-    Args:
-        region: AWS region for Bedrock service.
-
-    Returns:
-        BedrockResourceManager instance.
+    Region defaults to app.config.get_settings().aws_region.
     """
     global _manager
     if _manager is None:
-        _manager = BedrockResourceManager(region)
+        _manager = BedrockResourceManager(region or get_settings().aws_region)
     return _manager

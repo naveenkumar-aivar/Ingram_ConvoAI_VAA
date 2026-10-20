@@ -37,13 +37,18 @@ def compare(
 
     # Time the generic response
     start_generic = time.time()
-    generic_text = answer(question, pack_id=None, history=generic_hist)
+    generic_text, generic_metrics = answer(question, pack_id=None, history=generic_hist)
     generic_duration_ms = int((time.time() - start_generic) * 1000)
 
     # Time the adapted response
     start_adapted = time.time()
-    adapted_text = answer(question, pack_id=pack_id, history=adapted_hist) if pack_id else generic_text
-    adapted_duration_ms = int((time.time() - start_adapted) * 1000) if pack_id else 0
+    if pack_id:
+        adapted_text, adapted_metrics = answer(question, pack_id=pack_id, history=adapted_hist)
+        adapted_duration_ms = int((time.time() - start_adapted) * 1000)
+    else:
+        adapted_text = generic_text
+        adapted_metrics = generic_metrics
+        adapted_duration_ms = 0
 
     # Persist the new turn so the next question remembers this one.
     if session_id:
@@ -93,4 +98,10 @@ def compare(
         session_id=session_id or "",
         generic_duration_ms=generic_duration_ms,
         adapted_duration_ms=adapted_duration_ms,
+        generic_input_tokens=generic_metrics.get('input_tokens', 0),
+        generic_output_tokens=generic_metrics.get('output_tokens', 0),
+        adapted_input_tokens=adapted_metrics.get('input_tokens', 0),
+        adapted_output_tokens=adapted_metrics.get('output_tokens', 0),
+        generic_latency_ms=generic_metrics.get('latency_ms', 0),
+        adapted_latency_ms=adapted_metrics.get('latency_ms', 0),
     )

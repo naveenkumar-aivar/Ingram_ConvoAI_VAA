@@ -62,6 +62,7 @@ class Guardrails(BaseModel):
 class Integrations(BaseModel):
     """References to the AWS resources backing this pack."""
     knowledge_base_id: str | None = None
+    data_source_id: str | None = None  # Bedrock KB S3 data source (real path only)
     prompt_id: str | None = None
     guardrail_id: str | None = None
 
@@ -147,17 +148,27 @@ class ContextPack(BaseModel):
         )
 
         # 2b. Safety & refusals (hard behavioural rules — highest priority)
-        if self.guardrails.safety_rules or self.guardrails.denied_topics:
-            s.append("\n## Safety & refusals (STRICT — these override everything else)")
+        if self.guardrails.safety_rules:
+            s.append("\n## Safety & refusals")
+            s.append("Follow these safety rules STRICTLY:")
             for r in self.guardrails.safety_rules:
                 s.append(f"- {r}")
-            for t in self.guardrails.denied_topics:
-                s.append(f"- Never engage with or provide: {t}. Refuse and redirect to a qualified human.")
             s.append(
-                "If a user asks for something these rules prohibit, do NOT comply even "
-                "partially. Briefly refuse, explain you cannot help with that, and point "
-                "them to the appropriate professional or emergency service."
+                "If a user asks for something these rules prohibit, briefly refuse, "
+                "explain you cannot help with that specific aspect, and redirect them "
+                "to the appropriate professional or service. You MAY still provide "
+                "relevant policy information or procedural guidance that is within your scope."
             )
+        
+        # Denied topics are for truly out-of-scope content, not safety constraints
+        # within the domain. Only list them if they exist and are different from
+        # safety rules.
+        if self.guardrails.denied_topics:
+            s.append("\n## Additional restrictions")
+            s.append("Also avoid these specific topics entirely:")
+            for t in self.guardrails.denied_topics:
+                s.append(f"- {t}")
+            s.append("For these topics, politely redirect to an appropriate specialist.")
 
         # 3. Domain glossary (core terms inline; long ones via retrieval)
         core = self.core_ontology()
@@ -257,6 +268,11 @@ class NameCheckResponse(BaseModel):
     exists: bool
 
 
+class UpdateDraftRequest(BaseModel):
+    """Body for PUT /api/context-packs/{draft_id}/draft — the full edited pack."""
+    pack: "ContextPack"
+
+
 class ChatTurn(BaseModel):
     role: str  # user | assistant
     text: str
@@ -286,3 +302,11 @@ class CompareResponse(BaseModel):
     session_id: str = ""
     generic_duration_ms: int = 0  # Time to generate generic response (ms)
     adapted_duration_ms: int = 0  # Time to generate adapted response (ms)
+    # Token usage metrics
+    generic_input_tokens: int = 0
+    generic_output_tokens: int = 0
+    adapted_input_tokens: int = 0
+    adapted_output_tokens: int = 0
+    # Bedrock latency (from AWS)
+    generic_latency_ms: int = 0
+    adapted_latency_ms: int = 0

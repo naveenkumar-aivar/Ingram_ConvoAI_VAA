@@ -285,3 +285,166 @@ body { background: var(--bg); color: var(--text); font: 14px -apple-system, 'Seg
   font-size: 10px;
   font-family: ui-monospace, SFMono-Regular, Menlo, monospace;
 }
+
+/* ===== pack-approval-and-bedrock-enhancements ===== */
+
+/* Requirement 8 — shared evaluation bar spanning both chat panels.
+   Sits full-width below .panels and above the composer. */
+.eval-shared {
+  border-top: 1px solid var(--border);
+  background: var(--surface);
+  padding: 12px 14px;
+}
+.eval-shared .evaluation {
+  margin-top: 0;
+  background: var(--bg);
+}
+
+/* Requirement 4 — approval step list statuses (reuses .stages look). */
+.approve-steps { margin: 4px 0 14px; }
+.approve-steps li.in_progress { color: var(--text); }
+.approve-steps li.succeeded { color: #37c871; }
+.approve-steps li.failed { color: #ff9fb0; }
+.approve-steps li.pending { color: var(--dim); }
+
+/* Requirement 1 — edit form (reuses .advanced field styling). */
+.edit-form { margin-bottom: 16px; }
+.edit-form label { font-size: 11px; color: var(--dim); text-transform: uppercase; letter-spacing: .04em; }
+.edit-form input, .edit-form textarea {
+  background: var(--bg); border: 1px solid var(--border); color: var(--text);
+  padding: 8px 10px; border-radius: 7px; font: inherit; font-size: 13px; resize: vertical; width: 100%;
+}
+.approve:disabled { opacity: .45; cursor: default; }
+.reject:disabled { opacity: .45; cursor: default; }
+
+/* ===== Approval progress (polished) ===== */
+.approval {
+  background: var(--surface);
+  border: 1px solid var(--border);
+  border-radius: 12px;
+  padding: 18px 18px 16px;
+  margin: 4px 0 16px;
+}
+.approval-head {
+  display: flex;
+  align-items: baseline;
+  justify-content: space-between;
+  margin-bottom: 12px;
+}
+.approval-head h3 { margin: 0; font-size: 15px; font-weight: 600; }
+.approval-count { font-size: 12px; color: var(--dim); font-variant-numeric: tabular-nums; }
+
+.approval-bar {
+  height: 8px;
+  background: var(--bg);
+  border: 1px solid var(--border);
+  border-radius: 999px;
+  overflow: hidden;
+  margin-bottom: 16px;
+}
+.approval-fill {
+  height: 100%;
+  background: linear-gradient(90deg, #4f8cff, #6ba4ff);
+  border-radius: 999px;
+  transition: width .45s cubic-bezier(.4, 0, .2, 1);
+}
+.approval-bar.ok .approval-fill { background: linear-gradient(90deg, #27a567, #37c871); }
+.approval-bar.fail .approval-fill { background: linear-gradient(90deg, #c0453f, #ff6b63); }
+
+.approval-steps { list-style: none; margin: 0; padding: 0; display: flex; flex-direction: column; gap: 8px; }
+.astep {
+  display: flex;
+  gap: 12px;
+  align-items: flex-start;
+  padding: 11px 12px;
+  border: 1px solid var(--border);
+  border-radius: 10px;
+  background: var(--bg);
+  transition: border-color .2s, background .2s;
+}
+.astep.in_progress { border-color: #2b4a85; background: #121a2b; }
+.astep.succeeded { border-color: #27512f; }
+.astep.failed { border-color: #5c2b33; background: #1e1416; }
+.astep.pending { opacity: .6; }
+
+.astep-ico {
+  flex-shrink: 0;
+  width: 22px; height: 22px;
+  display: flex; align-items: center; justify-content: center;
+  border-radius: 50%;
+  margin-top: 1px;
+}
+.astep.succeeded .astep-ico { background: #16331f; }
+.astep.failed .astep-ico { background: #3a1f24; }
+.astep.pending .astep-ico { background: var(--surface2); }
+.astep-glyph { font-size: 13px; font-weight: 700; line-height: 1; }
+.astep.succeeded .astep-glyph { color: #7ee29a; }
+.astep.failed .astep-glyph { color: #ff9fb0; }
+.astep.pending .astep-glyph { color: var(--dim); }
+
+.spinner {
+  width: 14px; height: 14px;
+  border: 2px solid #2b4a85;
+  border-top-color: #6ba4ff;
+  border-radius: 50%;
+  animation: spin .7s linear infinite;
+}
+@keyframes spin { to { transform: rotate(360deg); } }
+
+.astep-body { flex: 1; min-width: 0; }
+.astep-row { display: flex; align-items: center; justify-content: space-between; gap: 8px; }
+.astep-label { font-size: 13.5px; font-weight: 500; color: var(--text); }
+.astep-badge {
+  font-size: 10px; text-transform: uppercase; letter-spacing: .05em;
+  padding: 2px 8px; border-radius: 999px; flex-shrink: 0;
+  background: var(--surface2); color: var(--dim);
+}
+.astep-badge.in_progress { background: #16233f; color: #9ec1ff; }
+.astep-badge.succeeded { background: #16331f; color: #7ee29a; }
+.astep-badge.failed { background: #3a1f24; color: #ff9fb0; }
+.astep-hint { font-size: 11.5px; color: var(--dim); margin-top: 3px; line-height: 1.4; word-break: break-word; }
+.astep.failed .astep-hint { color: #ffb3bd; }
+
+.approval-banner {
+  margin-top: 14px;
+  padding: 11px 13px;
+  border-radius: 9px;
+  font-size: 12.5px;
+  line-height: 1.45;
+}
+.approval-banner.ok { background: #16331f; border: 1px solid #27512f; color: #7ee29a; }
+.approval-banner.fail { background: #2a1a1d; border: 1px solid #5c2b33; color: #ffb3bd; }
+
+
+/* Selector section: step-by-step dropdown filters */
+.selector {
+  display: flex;
+  flex-direction: column;
+  gap: 8px;
+  margin-bottom: 12px;
+  padding: 12px;
+  background: var(--bg);
+  border: 1px solid var(--border);
+  border-radius: 8px;
+}
+.selector label {
+  font-size: 12px;
+  color: var(--text);
+  text-transform: capitalize;
+  letter-spacing: 0;
+  font-weight: 500;
+  margin-top: 2px;
+}
+.selector select {
+  background: var(--bg);
+  color: var(--text);
+  border: 1px solid var(--border);
+  padding: 8px 10px;
+  border-radius: 6px;
+  font: inherit;
+  font-size: 13px;
+}
+.selector select:disabled {
+  opacity: 0.5;
+  cursor: not-allowed;
+}

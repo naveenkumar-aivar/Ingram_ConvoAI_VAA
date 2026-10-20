@@ -11,7 +11,8 @@ Context-pack creation (the agent) follows a draft → approve flow:
 Chat (before/after demo with memory):
     GET    /api/health
     GET    /api/industries
-    GET    /api/context-packs?industry=
+    GET    /api/agent-names?industry=       list agent names for an industry
+    GET    /api/context-packs?industry=&agent_name=   list versions, optionally filtered by agent
     GET    /api/context-packs/{pack_id}
     GET    /api/context-packs/{pack_id}/system-prompt
     POST   /api/chat/session   DELETE /api/chat/session/{id}
@@ -19,8 +20,11 @@ Chat (before/after demo with memory):
 """
 from __future__ import annotations
 
+import json
+
 from fastapi import FastAPI, Form, HTTPException, UploadFile
 from fastapi.middleware.cors import CORSMiddleware
+from fastapi.responses import StreamingResponse
 
 from app.logging_config import setup_logging
 from app.middleware import RequestIDMiddleware
@@ -38,7 +42,9 @@ from app.models import (
     IndustryItem,
     NameCheckResponse,
     PackVersionItem,
+    UpdateDraftRequest,
 )
+from app.generator_tools import validate_pack
 from app.pack_builder import STAGES, BuildInput
 from app.generator_agent import build_pack_agentic
 from app.aws.storage import get_store
@@ -63,7 +69,7 @@ app.add_middleware(
 # ---------------------------------------------------------------- health/meta
 @app.get("/api/health")
 def health() -> dict:
-    return {"status": "ok", "mock_mode": settings.mock_mode, "llm_provider": settings.llm_provider}
+    return {"status": "ok", "service": "Vertical Adaptation Agent (AWS-only)"}
 
 
 @app.get("/api/industries", response_model=list[IndustryItem])
@@ -78,8 +84,14 @@ def stages() -> list[str]:
 
 # ---------------------------------------------------------------- read packs
 @app.get("/api/context-packs", response_model=list[PackVersionItem])
-def versions(industry: str) -> list[PackVersionItem]:
-    return get_store().list_versions(industry)
+def versions(industry: str, agent_name: str = '') -> list[PackVersionItem]:
+    return get_store().list_versions(industry, agent_name)
+
+
+@app.get("/api/agent-names")
+def agent_names(industry: str) -> list[str]:
+    """List unique agent names for a given industry."""
+    return get_store().list_agent_names(industry)
 
 
 @app.get("/api/context-packs/{pack_id}/system-prompt")
@@ -184,23 +196,53 @@ def generate_draft(req: GenerateRequest) -> DraftResponse:
         raise HTTPException(status_code=500, detail=f"Unexpected error: {str(exc)}") from exc
 
 
-@app.post("/api/context-packs/{draft_id}/approve", response_model=ContextPack)
-def approve_draft(draft_id: str) -> ContextPack:
+@app.put("/api/context-packs/{draft_id}/draft")
+def update_draft(draft_id: str, req: UpdateDraftRequest) -> dict:
+    """Save edited pack content to a draft, re-validate it, and return the
+    re-rendered preview. The submitted pack is stored BEFORE validation so the
+    author's edits are never lost (Requirement 1.3/1.4/1.7)."""
+    import logging
+    logger = logging.getLogger(__name__)
+
+    pack = req.pack  # already validated as a ContextPack by pydantic
+    pack_dict = pack.model_dump()
+
+    updated = drafts.update(draft_id, pack_dict)
+    if updated is None:
+        raise HTTPException(status_code=404, detail=f"No draft '{draft_id}'")
+
     try:
-        committed = drafts.approve(draft_id)
-        if not committed:
-            raise HTTPException(status_code=404, detail=f"No draft '{draft_id}'")
-        return committed
-    except HTTPException:
-        raise  # Re-raise HTTP exceptions
-    except Exception as exc:
+        gaps = validate_pack(json.dumps(pack_dict))
+    except Exception as exc:  # noqa: BLE001
+        logger.error(f"Re-validation failed for draft {draft_id}: {exc}", exc_info=True)
+        raise HTTPException(status_code=500, detail=f"Re-validation failed: {str(exc)}") from exc
+
+    return {
+        "pack": pack.model_dump(),
+        "system_prompt": pack.to_system_prompt(),
+        "gaps": gaps,
+    }
+
+
+@app.post("/api/context-packs/{draft_id}/approve")
+def approve_draft(draft_id: str) -> StreamingResponse:
+    """Approve a draft, streaming step-by-step progress as Server-Sent Events
+    (Requirement 4). Each event is a JSON object in an SSE `data:` frame."""
+    def _event_stream():
         import logging
         logger = logging.getLogger(__name__)
-        logger.error(f"Error approving draft {draft_id}: {exc}", exc_info=True)
-        raise HTTPException(
-            status_code=500,
-            detail=f"Failed to approve draft: {str(exc)}"
-        ) from exc
+        try:
+            for event in drafts.approve_stream(draft_id):
+                yield f"data: {json.dumps(event)}\n\n"
+        except Exception as exc:  # noqa: BLE001 — stream must terminate cleanly
+            logger.error(f"Error approving draft {draft_id}: {exc}", exc_info=True)
+            yield f"data: {json.dumps({'step': 'done', 'status': 'failed', 'detail': str(exc)})}\n\n"
+
+    return StreamingResponse(
+        _event_stream(),
+        media_type="text/event-stream",
+        headers={"Cache-Control": "no-cache", "X-Accel-Buffering": "no"},
+    )
 
 
 @app.delete("/api/context-packs/{draft_id}")

@@ -1,0 +1,52 @@
+# Python / local dev artifacts
+__pycache__/
+*.pyc
+*.pyo
+*.pyd
+*.so
+*.egg-info/
+.Python
+backend/.venv/
+backend/venv/
+backend/env/
+backend/.env
+backend/.env.local
+*.log
+
+# OS / editor
+.DS_Store
+.vscode/
+.idea/
+*.swp
+*.swo
+*~
+
+# Frontend
+node_modules/
+frontend/dist/
+frontend/build/
+frontend/.next/
+frontend/.cache/
+
+# Test files (keep test frameworks, ignore output)
+.pytest_cache/
+.coverage
+htmlcov/
+*.cover
+
+# Temporary files
+*.tmp
+*.bak
+*.orig
+
+# AWS / deployment
+.aws-sam/
+samconfig.toml
+
+# Jupyter notebooks checkpoints
+.ipynb_checkpoints/
+
+# Local data (all local storage removed - AWS only)
+kb-data/
+s3-data/
+logs/

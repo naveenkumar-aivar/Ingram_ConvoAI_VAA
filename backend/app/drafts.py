@@ -1,44 +1,111 @@
-"""Draft storage for the Create-a-Context-Pack flow.
+"""Draft storage for the Create-a-Context-Pack flow (S3 only).
 
 A generated pack is NOT committed until a human approves it. Until then it
-lives at s3-data/_drafts/<draft_id>.json.
+lives at s3-data/_drafts/<draft_id>.json in S3.
 
-Approval (the only time real folders are written):
-  1. version = v1 for a new (industry, name), else max+1 for that name.
-  2. create the guardrail resource.
-  3. write per-name source pieces: industry-docs/<industry>/<name>/<kind>/vN.json
-  4. merge generated ontology terms into the industry-common ontology
-     (append only missing terms, keep history).
-  5. ingest uploaded KB files into Chroma (per industry+name).
-  6. write the assembled pack: context-pack/<industry>/<name>/vN.json + latest.json
+Approval is a streamed, step-by-step operation (approve_stream). The context-
+pack version file is the SINGLE SOURCE OF TRUTH; nothing persona/prompts/
+guardrails/handoff is written under industry-docs any more. Steps, in order:
+  1. "s3"        : finalise meta + merge industry-common ontology + save pack.
+  2. "guardrail" : create the real Bedrock guardrail from the pack; write its
+                   id/version into pack.integrations + pack.guardrails.
+  3. "kb"        : ingest uploaded KB files into the vector store (NON-FATAL).
+  4. "prompt"    : create the real Bedrock Prompt Management resource; write its
+                   id into pack.integrations.
+Finally the pack is re-saved so the resource ids persist, the draft is
+discarded, and a terminal "done" event carries the committed pack.
+
+Guardrail and prompt steps create real Bedrock resources (guardrail/prompt
+resources are always created). The KB step ingests files into Bedrock KB.
 """
 from __future__ import annotations
 
 import json
+import logging
 import uuid
-from pathlib import Path
+from typing import Iterator
 
 from app.config import get_settings
 from app.models import ContextPack
 from app.aws import pieces
 from app.aws.storage import get_store
-from app.aws.bedrock_resources import get_bedrock_manager, BedrockResourcesError
+from app.aws.bedrock_resources import (
+    get_bedrock_manager,
+    BedrockResourcesError,
+    GuardrailCreationError,
+    PromptTemplateError,
+)
+
+logger = logging.getLogger(__name__)
 
 
-def _drafts_dir() -> Path:
-    s = get_settings()
-    d = (Path(__file__).resolve().parents[1] / s.local_s3_dir / "_drafts").resolve()
-    d.mkdir(parents=True, exist_ok=True)
-    return d
+def _s3_client():
+    """Lazy get S3 client."""
+    import boto3
+
+    settings = get_settings()
+    return boto3.client("s3", region_name=settings.aws_region)
 
 
-def _file(draft_id: str) -> Path:
-    return _drafts_dir() / f"{draft_id}.json"
+def _draft_key(draft_id: str) -> str:
+    """S3 key for draft storage."""
+    return f"_drafts/{draft_id}.json"
+
+
+def _get_draft(draft_id: str) -> dict | None:
+    """Load draft from S3."""
+    try:
+        settings = get_settings()
+        s3 = _s3_client()
+        key = _draft_key(draft_id)
+        response = s3.get_object(Bucket=settings.s3_bucket, Key=key)
+        body = response["Body"].read()
+        return json.loads(body)
+    except Exception as exc:  # noqa: BLE001
+        logger.debug(f"[drafts] get {draft_id} failed: {exc}")
+        return None
+
+
+def _save_draft(draft_id: str, draft_data: dict) -> bool:
+    """Save draft to S3."""
+    try:
+        settings = get_settings()
+        s3 = _s3_client()
+        key = _draft_key(draft_id)
+        body = json.dumps(draft_data, indent=2)
+        s3.put_object(
+            Bucket=settings.s3_bucket,
+            Key=key,
+            Body=body,
+            ContentType="application/json",
+        )
+        logger.debug(f"[drafts] saved {key}")
+        return True
+    except Exception as exc:  # noqa: BLE001
+        logger.error(f"[drafts] save {draft_id} failed: {exc}")
+        return False
+
+
+def _delete_draft(draft_id: str) -> None:
+    """Delete draft from S3."""
+    try:
+        settings = get_settings()
+        s3 = _s3_client()
+        key = _draft_key(draft_id)
+        s3.delete_object(Bucket=settings.s3_bucket, Key=key)
+        logger.debug(f"[drafts] deleted {key}")
+    except Exception as exc:  # noqa: BLE001
+        logger.warning(f"[drafts] delete {draft_id} failed: {exc}")
 
 
 # ---------------------------------------------------------------------------
-def create(pack: ContextPack, report: dict, name: str, kb_file_names: list[str] | None = None, 
-           user_inputs: dict | None = None) -> str:
+def create(
+    pack: ContextPack,
+    report: dict,
+    name: str,
+    kb_file_names: list[str] | None = None,
+    user_inputs: dict | None = None,
+) -> str:
     draft_id = uuid.uuid4().hex
     payload = {
         "draft_id": draft_id,
@@ -46,153 +113,203 @@ def create(pack: ContextPack, report: dict, name: str, kb_file_names: list[str] 
         "pack": pack.model_dump(),
         "report": report,
         "kb_file_names": kb_file_names or [],
-        "user_inputs": user_inputs or {}
+        "user_inputs": user_inputs or {},
     }
-    _file(draft_id).write_text(json.dumps(payload, indent=2))
+    _save_draft(draft_id, payload)
     return draft_id
 
 
 def get(draft_id: str) -> dict | None:
-    f = _file(draft_id)
-    if not f.exists():
-        return None
-    try:
-        return json.loads(f.read_text())
-    except Exception:  # noqa: BLE001
-        return None
+    return _get_draft(draft_id)
 
 
 def discard(draft_id: str) -> None:
-    f = _file(draft_id)
-    if f.exists():
-        f.unlink()
+    _delete_draft(draft_id)
+
+
+def update(draft_id: str, pack_dict: dict) -> dict | None:
+    """Overwrite the stored draft's "pack" with pack_dict (the edited pack) and
+    return the updated draft record. Returns None if the draft does not exist."""
+    draft = get(draft_id)
+    if not draft:
+        return None
+    draft["pack"] = pack_dict
+    _save_draft(draft_id, draft)
+    return draft
 
 
 # ---------------------------------------------------------------------------
 def _next_version(industry: str, name: str) -> int:
     """v1 for a brand-new (industry, name), else highest existing + 1.
 
-    Works in both modes:
-      - MOCK_MODE=true  -> scan the local context-pack/<industry>/<name>/ folder.
-      - MOCK_MODE=false -> derive from the pack ids already loaded from S3
-        (pack ids look like '<name>-vN').
+    Derives version from the pack ids already loaded from S3.
+    (pack ids look like '<name>-vN').
     """
     s = get_settings()
-
-    if not s.mock_mode:
-        store = get_store()
-        nums = []
-        for pack in store._packs.values():  # loaded from S3 at startup / after saves
-            if pack.meta.industry.lower() != industry.lower():
-                continue
-            pid = pack.meta.pack_id.lower()
-            base, _, ver = pid.rpartition("-v")
-            if base == name.lower() and ver.isdigit():
-                nums.append(int(ver))
-        return (max(nums) + 1) if nums else 1
-
-    root = (Path(__file__).resolve().parents[1] / s.local_s3_dir
-            / s.context_pack_prefix / industry.lower() / name.lower()).resolve()
-    if not root.exists():
-        return 1
+    store = get_store()
     nums = []
-    for p in root.glob("v*.json"):
-        try:
-            nums.append(int(p.stem.lstrip("v")))
-        except ValueError:
-            pass
+    for pack in store._packs.values():  # loaded from S3 at startup / after saves
+        if pack.meta.industry.lower() != industry.lower():
+            continue
+        pid = pack.meta.pack_id.lower()
+        base, _, ver = pid.rpartition("-v")
+        if base == name.lower() and ver.isdigit():
+            nums.append(int(ver))
     return (max(nums) + 1) if nums else 1
 
 
-def approve(draft_id: str) -> ContextPack | None:
-    import logging
-    logger = logging.getLogger(__name__)
-    
-    try:
-        draft = get(draft_id)
-        if not draft:
-            return None
+def approve_stream(draft_id: str) -> Iterator[dict]:
+    """Approve a draft, yielding progress events for each Approval_Step.
 
+    Yields dict events. For each step it emits an "in_progress" event, then a
+    terminal "succeeded"/"failed" event for that step. The final event has
+    step "done" and either carries the committed pack (succeeded) or an error
+    detail (failed).
+
+    Step order (Requirement 4.2): s3 -> guardrail -> kb -> prompt.
+    """
+    draft = get(draft_id)
+    if not draft:
+        yield {"step": "done", "status": "failed", "detail": f"No draft '{draft_id}'"}
+        return
+
+    try:
         pack = ContextPack.model_validate(draft["pack"])
-        industry = pack.meta.industry
-        name = (draft.get("name") or industry.lower()).strip()
+    except Exception as exc:  # noqa: BLE001
+        logger.error(f"[drafts] Draft {draft_id} is not a valid pack: {exc}", exc_info=True)
+        yield {"step": "done", "status": "failed", "detail": f"Invalid draft pack: {exc}"}
+        return
+
+    industry = pack.meta.industry
+    name = (draft.get("name") or industry.lower()).strip()
+
+    # ---- step 1: s3 (finalise meta + ontology merge + first save) ----------
+    yield {"step": "s3", "status": "in_progress"}
+    try:
         version = _next_version(industry, name)
         vstr = f"v{version}"
-
-        # finalise meta — pack_id = "<name>-vN"
         pack.meta.version = vstr
         pack.meta.status = "active"
         pack.meta.pack_id = f"{name.lower()}-{vstr}"
 
-        # NOTE: Bedrock guardrail + prompt-management creation are intentionally
-        # NOT done here yet. For now approval only PERSISTS everything to S3
-        # (the source of truth). The guardrail text (denied topics, blocked
-        # phrases, pii blocks) and prompts are still saved as JSON, so a real
-        # Bedrock guardrail / prompt can be created from them later and its id
-        # written back into pack.integrations.
+        # industry-common ontology — append only missing terms (keeps history).
+        pieces.merge_ontology(industry, [o.model_dump() for o in pack.ontology])
 
-        # --- STORAGE (the critical part) ------------------------------------
-        # per-name source pieces (reusable next time)
+        # First save: the context-pack version file is the single source of truth.
+        # persist_pack returns False if the real S3 write failed (e.g. expired
+        # token) — surface that as a failed step rather than a false success.
+        if not get_store().persist_pack(pack):
+            raise RuntimeError("S3 write failed (check AWS credentials / bucket access)")
+        logger.info(f"[drafts] Saved pack {pack.meta.pack_id} for {industry}/{name}")
+        yield {"step": "s3", "status": "succeeded"}
+    except Exception as exc:  # noqa: BLE001
+        logger.error(f"[drafts] S3 step failed for {draft_id}: {exc}", exc_info=True)
+        yield {"step": "s3", "status": "failed", "detail": str(exc)}
+        yield {"step": "done", "status": "failed", "detail": f"S3 step failed: {exc}"}
+        return
+
+    had_failure = False
+    failure_detail: str | None = None
+
+    # ---- step 2: guardrail -------------------------------------------------
+    yield {"step": "guardrail", "status": "in_progress"}
+    try:
+        gr = get_bedrock_manager().create_guardrail_from_pack(pack)
+        pack.integrations.guardrail_id = gr["id"]
+        pack.guardrails.guardrail_id = gr["id"]
+        pack.guardrails.guardrail_version = gr["version"]
+        yield {"step": "guardrail", "status": "succeeded"}
+    except (GuardrailCreationError, BedrockResourcesError) as exc:
+        had_failure = True
+        failure_detail = f"guardrail step failed: {exc}"
+        logger.warning(f"[drafts] {failure_detail}")
+        yield {"step": "guardrail", "status": "failed", "detail": str(exc)}
+
+    # ---- step 3: kb (NON-FATAL) --------------------------------------------
+    yield {"step": "kb", "status": "in_progress"}
+    kb_files = draft.get("kb_file_names") or []
+    if not kb_files:
+        yield {"step": "kb", "status": "succeeded", "detail": "no uploaded files"}
+    else:
+        # Real path: provision a managed Bedrock KB over the uploaded files in
+        # S3 and ingest. Non-fatal: a KBError (or FAILED ingestion) must not
+        # abort approval — we emit failed and continue, keeping any KB id set.
         try:
-            pieces.save_name_piece(industry, name, "persona", pack.persona.model_dump(), version)
-            pieces.save_name_piece(industry, name, "prompts", {"system_prompt_lines": pack.domain_prompts}, version)
-            pieces.save_name_piece(industry, name, "handoff", {"rules": [r.model_dump() for r in pack.escalation_rules]}, version)
-            pieces.save_name_piece(industry, name, "guardrails", pack.guardrails.model_dump(), version)
-        except Exception as e:
-            logger.error(f"[drafts] Pieces save failed: {e}", exc_info=True)
-            raise
+            from app.aws.bedrock_kb import create_managed_kb, ingest_kb, KBError
+            res = create_managed_kb(industry, name)
+            pack.integrations.knowledge_base_id = res["knowledge_base_id"]
+            pack.integrations.data_source_id = res["data_source_id"]
+            job_id = ingest_kb(res["knowledge_base_id"], res["data_source_id"])
+            # ingest_kb returns the job_id (not the final status); ingestion runs
+            # asynchronously in AWS and can take 5–10+ minutes. We emit success
+            # once the job is queued (no long polling in the approval stream).
+            yield {
+                "step": "kb",
+                "status": "succeeded",
+                "detail": f"KB {res['knowledge_base_id']} created; ingestion job {job_id} queued (~5–10 min)",
+            }
+        except Exception as exc:  # noqa: BLE001 — KB failure must not block approval
+            had_failure = True
+            failure_detail = f"knowledge base step failed: {exc}"
+            logger.warning(f"[drafts] {failure_detail}")
+            yield {"step": "kb", "status": "failed", "detail": str(exc)}
 
-        # industry-common ontology — append only missing terms (keeps history)
-        try:
-            pieces.merge_ontology(industry, [o.model_dump() for o in pack.ontology])
-        except Exception as e:
-            logger.error(f"[drafts] Ontology merge failed: {e}", exc_info=True)
-            raise
+    # ---- step 4: prompt ----------------------------------------------------
+    yield {"step": "prompt", "status": "in_progress"}
+    try:
+        pr = get_bedrock_manager().create_prompt_from_pack(pack)
+        pack.integrations.prompt_id = pr["id"]
+        yield {"step": "prompt", "status": "succeeded"}
+    except (PromptTemplateError, BedrockResourcesError) as exc:
+        had_failure = True
+        failure_detail = f"prompt step failed: {exc}"
+        logger.warning(f"[drafts] {failure_detail}")
+        yield {"step": "prompt", "status": "failed", "detail": str(exc)}
 
-        # ingest uploaded KB files into Chroma (per industry+name). Non-fatal:
-        # a KB problem must not block storing the pack.
-        kb_files = draft.get("kb_file_names") or []
-        if kb_files:
-            try:
-                from app.aws.knowledge_base import ingest
-                collection = ingest(industry, name, kb_files)
-                pack.integrations.knowledge_base_id = collection
-            except Exception as exc:  # noqa: BLE001
-                logger.warning(f"[drafts] KB ingest skipped: {exc}")
-
-        # Create Bedrock resources (guardrails + prompt template) from stored pieces.
-        # Non-fatal: Bedrock resource creation should not block pack approval.
-        try:
-            bedrock_mgr = get_bedrock_manager()
-            
-            # Load guardrails and prompts pieces from storage
-            guardrails_piece = pieces.load_piece(industry, name, "guardrails", version)
-            prompts_piece = pieces.load_piece(industry, name, "prompts", version)
-            
-            # Sync to Bedrock and update pack with resource IDs
-            pack_dict = pack.model_dump()
-            pack_dict = bedrock_mgr.sync_to_pack(
-                industry=industry,
-                usecase=name,
-                pack_data=pack_dict,
-                guardrails_piece=guardrails_piece,
-                prompts_piece=prompts_piece,
-            )
-            # Reconstruct pack from updated dict
-            pack = ContextPack.model_validate(pack_dict)
-            logger.info(f"[drafts] Bedrock resources created for {industry}/{name}")
-        except BedrockResourcesError as e:
-            logger.warning(f"[drafts] Bedrock resource creation failed (non-fatal): {e}")
-        except Exception as e:  # noqa: BLE001
-            logger.warning(f"[drafts] Unexpected error creating Bedrock resources: {e}")
-
-        # assembled context pack (storage writes name-level file + latest.json)
-        get_store().save_pack(pack)
-        logger.info(f"[drafts] Approved pack {pack.meta.pack_id} for {industry}/{name}")
-
+    # ---- finalise: re-save to persist resource ids, discard draft ----------
+    try:
+        # Re-persist so the resource ids written above reach S3. A False result
+        # (real write rejected) is non-fatal but must be reported in the
+        # terminal event rather than silently reported as success.
+        if not get_store().persist_pack(pack):
+            had_failure = True
+            failure_detail = failure_detail or "failed to persist resource ids to S3"
+            logger.warning(f"[drafts] final persist_pack failed for {pack.meta.pack_id}")
         discard(draft_id)
-        return pack
-    
-    except Exception as e:
-        logger.error(f"[drafts] Approval failed for {draft_id}: {e}", exc_info=True)
-        raise
+        logger.info(f"[drafts] Approved pack {pack.meta.pack_id} for {industry}/{name}")
+    except Exception as exc:  # noqa: BLE001
+        logger.error(f"[drafts] Final save failed for {draft_id}: {exc}", exc_info=True)
+        yield {"step": "done", "status": "failed", "detail": f"Final save failed: {exc}"}
+        return
+
+    if had_failure:
+        yield {
+            "step": "done",
+            "status": "failed",
+            "detail": failure_detail or "one or more approval steps failed",
+            "pack": pack.model_dump(),
+        }
+    else:
+        yield {"step": "done", "status": "succeeded", "pack": pack.model_dump()}
+
+
+def approve(draft_id: str) -> ContextPack | None:
+    """Synchronous approval — drives approve_stream to completion and returns the
+    committed pack (or None if the draft was missing). Kept for callers that do
+    not need the streamed events."""
+    committed: ContextPack | None = None
+    missing = False
+    for event in approve_stream(draft_id):
+        if event.get("step") == "done":
+            if event.get("status") == "succeeded" and event.get("pack"):
+                committed = ContextPack.model_validate(event["pack"])
+            elif event.get("pack"):
+                # Failed step but pack persisted (Requirement 7.10 / 10.4).
+                committed = ContextPack.model_validate(event["pack"])
+            else:
+                detail = event.get("detail") or ""
+                if "No draft" in detail:
+                    missing = True
+    if missing:
+        return None
+    return committed

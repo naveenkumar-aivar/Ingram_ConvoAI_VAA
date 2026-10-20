@@ -1,6 +1,6 @@
 """
-S3 Manager - Handle all S3 operations for context packs, industry docs, and logs
-Not wired yet - activated via storage_router when MOCK_MODE=false
+S3 Manager - Handle S3 operations for uploaded files, industry-docs pieces,
+and context packs.
 """
 
 import boto3
@@ -27,64 +27,8 @@ class S3Manager:
         # Prefixes
         self.industry_docs_prefix = os.getenv("INDUSTRY_DOCS_PREFIX", "industry-docs/")
         self.context_pack_prefix = os.getenv("CONTEXT_PACK_PREFIX", "context-pack/")
-        self.sessions_prefix = "sessions/"
-        self.logs_prefix = "logs/"
     
-    # ========== INDUSTRY DOCS (Approved Details) ==========
-    
-    def save_industry_doc(
-        self,
-        industry: str,
-        usecase: str,
-        doc_type: str,  # persona, prompts, guardrails, handoff
-        data: Dict[str, Any],
-        version: str = "v1"
-    ) -> bool:
-        """
-        Save approved industry document to S3
-        Path: industry-docs/{industry}/{usecase}/{doc_type}/{version}.json
-
-        industry/usecase are lowercased for the S3 KEY so casing never produces
-        duplicate prefixes (e.g. Healthcare/ vs healthcare/) in the bucket.
-        """
-        try:
-            industry = (industry or "").strip().lower()
-            usecase = (usecase or "").strip().lower()
-            key = f"{self.industry_docs_prefix}{industry}/{usecase}/{doc_type}/{version}.json"
-            self.s3_client.put_object(
-                Bucket=self.bucket,
-                Key=key,
-                Body=json.dumps(data, indent=2),
-                ContentType="application/json"
-            )
-            logger.info(f"Saved industry doc: {key}")
-            return True
-        except Exception as e:
-            logger.error(f"Error saving industry doc: {e}")
-            return False
-    
-    def load_industry_doc(
-        self,
-        industry: str,
-        usecase: str,
-        doc_type: str,
-        version: str = "v1"
-    ) -> Optional[Dict[str, Any]]:
-        """Load industry document from S3 (key lowercased to match save)."""
-        try:
-            industry = (industry or "").strip().lower()
-            usecase = (usecase or "").strip().lower()
-            key = f"{self.industry_docs_prefix}{industry}/{usecase}/{doc_type}/{version}.json"
-            response = self.s3_client.get_object(Bucket=self.bucket, Key=key)
-            data = json.loads(response['Body'].read())
-            logger.info(f"Loaded industry doc: {key}")
-            return data
-        except self.s3_client.exceptions.NoSuchKey:
-            logger.warning(f"Industry doc not found: {key}")
-            return None
-        except Exception as e:
-            logger.error(f"Error loading industry doc: {e}")
-            return None
+    # ========== UPLOADED FILES ==========
     
     def save_uploaded_file(
         self,
@@ -152,31 +96,6 @@ class S3Manager:
             return names
         except Exception as e:
             logger.error(f"Error listing uploaded files: {e}")
-            return []
-    
-    def list_industry_docs(
-        self,
-        industry: str,
-        usecase: str,
-        doc_type: str
-    ) -> List[str]:
-        """List all versions of a document type"""
-        try:
-            industry = (industry or "").strip().lower()
-            usecase = (usecase or "").strip().lower()
-            prefix = f"{self.industry_docs_prefix}{industry}/{usecase}/{doc_type}/"
-            response = self.s3_client.list_objects_v2(
-                Bucket=self.bucket,
-                Prefix=prefix
-            )
-            
-            if 'Contents' not in response:
-                return []
-            
-            versions = [obj['Key'].split('/')[-1] for obj in response['Contents']]
-            return versions
-        except Exception as e:
-            logger.error(f"Error listing industry docs: {e}")
             return []
 
     # ----- generic industry-docs helpers (arbitrary relative path) -----
@@ -341,118 +260,6 @@ class S3Manager:
             logger.error(f"Error listing context packs: {e}")
             return []
     
-    # ========== SESSIONS ==========
-    
-    def save_session_data(
-        self,
-        session_id: str,
-        data: Dict[str, Any]
-    ) -> bool:
-        """Save session data to S3"""
-        try:
-            key = f"{self.sessions_prefix}{session_id}/metadata.json"
-            self.s3_client.put_object(
-                Bucket=self.bucket,
-                Key=key,
-                Body=json.dumps(data, indent=2),
-                ContentType="application/json"
-            )
-            logger.info(f"Saved session data: {key}")
-            return True
-        except Exception as e:
-            logger.error(f"Error saving session data: {e}")
-            return False
-    
-    def load_session_data(self, session_id: str) -> Optional[Dict[str, Any]]:
-        """Load session data from S3"""
-        try:
-            key = f"{self.sessions_prefix}{session_id}/metadata.json"
-            response = self.s3_client.get_object(Bucket=self.bucket, Key=key)
-            data = json.loads(response['Body'].read())
-            logger.info(f"Loaded session data: {key}")
-            return data
-        except self.s3_client.exceptions.NoSuchKey:
-            logger.warning(f"Session data not found: {key}")
-            return None
-        except Exception as e:
-            logger.error(f"Error loading session data: {e}")
-            return None
-    
-    def append_session_history(
-        self,
-        session_id: str,
-        entry: Dict[str, Any]
-    ) -> bool:
-        """Append conversation entry to session history (JSONL format)"""
-        try:
-            key = f"{self.sessions_prefix}{session_id}/conversation-history.jsonl"
-            # Read existing
-            try:
-                response = self.s3_client.get_object(Bucket=self.bucket, Key=key)
-                content = response['Body'].read().decode('utf-8')
-            except:
-                content = ""
-            
-            # Append new entry
-            content += json.dumps(entry) + "\n"
-            
-            self.s3_client.put_object(
-                Bucket=self.bucket,
-                Key=key,
-                Body=content.encode('utf-8'),
-                ContentType="application/x-ndjson"
-            )
-            logger.info(f"Appended to session history: {key}")
-            return True
-        except Exception as e:
-            logger.error(f"Error appending session history: {e}")
-            return False
-    
-    # ========== LOGS ==========
-    
-    def save_log(self, log_type: str, log_data: Dict[str, Any]) -> bool:
-        """
-        Save log to S3
-        log_type: bedrock-calls, agent-execution, errors
-        """
-        try:
-            timestamp = datetime.utcnow().isoformat().replace(':', '-')
-            date = datetime.utcnow().strftime("%Y-%m-%d")
-            key = f"{self.logs_prefix}{log_type}/{date}/{log_type}-{timestamp}.json"
-            
-            self.s3_client.put_object(
-                Bucket=self.bucket,
-                Key=key,
-                Body=json.dumps(log_data, indent=2, default=str),
-                ContentType="application/json"
-            )
-            logger.info(f"Saved log: {key}")
-            return True
-        except Exception as e:
-            logger.error(f"Error saving log: {e}")
-            return False
-    
-    # ========== UTILITY ==========
-    
-    def bucket_exists(self) -> bool:
-        """Check if bucket exists"""
-        try:
-            self.s3_client.head_bucket(Bucket=self.bucket)
-            return True
-        except:
-            return False
-    
-    def delete_object(self, key: str) -> bool:
-        """Delete an object from S3"""
-        try:
-            self.s3_client.delete_object(Bucket=self.bucket, Key=key)
-            logger.info(f"Deleted: {key}")
-            return True
-        except Exception as e:
-            logger.error(f"Error deleting object: {e}")
-            return False
-
-
 # Singleton instance
 _s3_manager_instance = None
 

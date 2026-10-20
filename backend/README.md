@@ -1,28 +1,32 @@
 # Vertical Adaptation Agent — Backend
 
-Bedrock-only backend for the Vertical Adaptation Agent. It adapts one generic
-chatbot to an industry by generating and applying a versioned **context pack**
-(persona, domain prompts, escalation rules, guardrails), and exposes a small
-HTTP API the UI (and any existing website/agent) calls.
+FastAPI backend for the **Vertical Adaptation Agent**. It adapts a single
+generic chatbot to a specific industry/usecase by generating and applying a
+versioned **context pack** (persona, scope, domain prompts, ontology,
+escalation rules, guardrails), and exposes a small HTTP API the React/Vite UI
+calls.
 
-Built with **FastAPI** + the **Strands Agents SDK**, talking to **Amazon
-Bedrock** (model + Knowledge Bases + Guardrails + Prompt Management) and
-**S3**. AgentCore is intentionally **not** used yet (not in the SOW) — the
-agent is structured so it can be hosted on AgentCore later with minimal change.
+The pack is generated agentically (Strands Agents SDK + Amazon Bedrock, with a
+deterministic fallback), reviewed and edited by a human, then **approved** —
+and approval provisions real per-industry/usecase AWS resources, streamed to
+the UI as Server-Sent Events (SSE).
 
 ---
 
-## Mock mode vs. real mode
+## Architecture: AWS-Only Backend
 
-The single most important setting is `MOCK_MODE` (in `.env`):
+**This is a pure AWS implementation.** All storage, retrieval, and LLM operations
+use AWS services exclusively. No local fallback, no mock mode, no Chroma.
 
-| MOCK_MODE | Behaviour |
-|-----------|-----------|
-| `true` (default) | No AWS calls. Returns realistic mock data. Runs with zero credentials. |
-| `false` | Real AWS via boto3 / Strands. Needs credentials + Bedrock model access. |
-
-This means the whole stack runs and demos **today without AWS**, and flips to
-real AWS by changing one env var (plus confirming the model id + region).
+| Component | Implementation |
+|-----------|-----------------|
+| **Storage** | Amazon S3 (context packs, industry docs, uploaded KB files) |
+| **Sessions** | Amazon DynamoDB (chat memory, auto-expiring with TTL) |
+| **LLM** | Amazon Bedrock (Claude, Llama, or other available models) |
+| **Knowledge Base** | Bedrock managed Knowledge Base (vector search over uploaded docs) |
+| **Safety** | Bedrock Guardrails (topic denial, phrase blocking, PII protection) |
+| **Prompts** | Bedrock Prompt Management (versioned, reusable system prompts) |
+| **Logging** | CloudWatch (structured JSON logs with request tracing) |
 
 ---
 
@@ -31,84 +35,183 @@ real AWS by changing one env var (plus confirming the model id + region).
 ```
 backend/
 ├── requirements.txt
-├── .env.example            # copy to .env
+├── .env.example               # copy to .env (AWS config only)
 └── app/
-    ├── config.py           # Settings (MOCK_MODE, LLM_PROVIDER, region, bucket)
-    ├── models.py           # ContextPack + API request/response shapes
-    ├── pack_builder.py     # the agent — builds a pack, REUSING existing pieces
-    ├── drafts.py           # draft (temp) storage; commit on approve, discard on reject
-    ├── agent.py            # answer() — the chatbot. AgentCore-portable.
-    ├── compare.py          # compare() — before/after + evaluation
-    ├── evaluator.py        # LLM-as-judge scoring of the two answers
-    ├── sessions.py         # conversation memory (per session_id)
-    ├── main.py             # FastAPI app (the HTTP layer)
+    ├── main.py                # FastAPI app — the HTTP layer (thin wrapper)
+    ├── config.py              # AWS settings (region, bucket, model ID, table names)
+    ├── models.py              # ContextPack + API request/response shapes
+    ├── pack_builder.py        # deterministic pack builder + STAGES + BuildInput
+    ├── generator_agent.py     # agentic pack builder (Strands + Bedrock)
+    ├── generator_tools.py     # agent tools: reuse-discovery, validate_pack, shape_guardrail_and_prompt
+    ├── drafts.py              # draft create/get/update/discard + approve_stream (SSE, S3 storage)
+    ├── agent.py               # answer() — the chatbot (generic vs adapted + RAG)
+    ├── compare.py             # before/after comparison + evaluation + timing
+    ├── evaluator.py           # LLM-as-judge scoring of the two answers (Bedrock)
+    ├── sessions.py            # conversation memory (DynamoDB, auto-expiring)
+    ├── logging_config.py      # CloudWatch JSON logging
+    ├── middleware.py          # request id + slow-request logging
     └── aws/
-        ├── bedrock_client.py  # Bedrock calls: KB retrieve + guardrail (mock/real)
-        ├── pieces.py          # reusable source pieces per industry (discover/read/write)
-        └── storage.py         # context-pack catalog (local s3-data / S3)
+        ├── storage.py             # context-pack catalog (list/get/save packs from S3)
+        ├── pieces.py              # ontology merge + reuse discovery (S3 only)
+        ├── bedrock_resources.py   # Bedrock Guardrail + Prompt Management creation
+        ├── bedrock_kb.py          # managed Bedrock Knowledge Base (create + ingest)
+        ├── bedrock_client.py      # Bedrock Runtime + Agent Runtime client
+        └── s3_manager.py          # low-level S3 operations
+
+scripts/
+└── cleanup_s3_case_duplicates.py  # utility: remove case-duplicate S3 prefixes
 ```
 
-Key design rules:
-- **All AWS/business logic lives server-side**; `main.py` is a thin wrapper.
-- `agent.py:answer()` and `pack_builder.py:build_pack()` have no web code, so
-  they are the units a future AgentCore deployment would host.
+Design rules:
+- **All AWS/business logic lives server-side.** `main.py` is a thin HTTP wrapper.
 - The pack-building agent **reuses existing pieces** (`aws/pieces.py`) and only
-  generates what's missing — "don't build the wheel again".
+  generates what is missing.
+- **100% AWS storage & compute.** No local files, no mock modes, no fallback paths.
 
 ---
 
 ## Running it
 
-Requires **Python ≥ 3.10** (Strands). This repo was set up with Python 3.11
-via `uv`.
+Requires **Python ≥ 3.10** (Strands). This repo was set up with Python 3.11 via `uv`.
 
 ```bash
 cd backend
 
-# one-time: create venv + install (uv)
+# one-time: create venv + install
 uv venv --python 3.11 .venv
 uv pip install --python .venv/bin/python -r requirements.txt
 
 # config
-cp .env.example .env          # defaults to MOCK_MODE=true
+cp .env.example .env          # set AWS credentials and region
 
 # run
 .venv/bin/python -m uvicorn app.main:app --reload --port 8000
 ```
 
-Health check: `curl localhost:8000/api/health` → `{"status":"ok","mock_mode":true}`
+Health check:
 
-Interactive API docs: open `http://localhost:8000/docs`.
+```bash
+curl localhost:8000/api/health
+# {"status":"ok","service":"Vertical Adaptation Agent (AWS-only)"}
+```
 
----
-
-## Switching to real AWS (tomorrow)
-
-1. **Credentials**: run `aws configure` / `aws sso login` (boto3 reads the
-   standard chain — you usually don't put keys in `.env`).
-2. **Enable Bedrock model access**: AWS console → Bedrock → *Model access* →
-   request the Claude model(s) you'll use.
-3. **Confirm the model id**: copy the exact id from the console into
-   `BEDROCK_MODEL_ID`. Do **not** guess — Bedrock rejects wrong ids. (Ids are
-   often inference-profile ids prefixed `us.`.)
-4. **Pick a region** where Bedrock + Knowledge Bases + Guardrails + the model
-   are all available; set `AWS_REGION`.
-5. **S3 bucket**: create it, set `S3_BUCKET`. Context packs are written to
-   `s3://<bucket>/context-packs/`.
-6. Set `MOCK_MODE=false` and restart.
-
-Nothing in the application logic changes between mock and real — only
-`aws/bedrock_client.py` and `aws/storage.py` switch behaviour internally.
+Interactive API docs: `http://localhost:8000/docs`.
 
 ---
 
-## How the demo works
+## Configuration (`.env`)
 
-- **Chatbot (before/after):** `POST /api/chat/compare` runs the agent twice for
-  one question — once with no pack (generic) and once with the selected pack
-  (adapted) — and returns both answers plus evaluation metrics.
-- **Create a Context Pack:** `POST /api/context-packs/generate` runs the 6-step
-  generator, creates the guardrail, stores the pack, and returns it for the
-  human-in-the-loop review step before it goes live.
+| Variable | Default | Purpose |
+|----------|---------|---------|
+| `AWS_REGION` | `us-east-1` | AWS region for S3, Bedrock, DynamoDB. |
+| `BEDROCK_MODEL_ID` | `CONFIRM_IN_CONSOLE` | Exact model/inference-profile id from the Bedrock console. |
+| `S3_BUCKET` | `vertical-adaption-agent` | S3 bucket for context packs, docs, KB files. |
+| `CONTEXT_PACK_PREFIX` | `context-pack/` | S3 prefix for context-pack version files. |
+| `INDUSTRY_DOCS_PREFIX` | `industry-docs/` | S3 prefix for ontology + uploaded data. |
+| `KB_ROLE_NAME` | `vaa-bedrock-kb-role` | IAM role the managed Bedrock KB assumes (self-provisioned once, idempotent). |
+| `SESSIONS_TABLE_NAME` | `vaa-sessions` | DynamoDB table for chat sessions (self-provisioned once, with TTL). |
+| `SESSION_TTL_DAYS` | `30` | Days a chat session is kept before DynamoDB TTL expires it. |
+| `API_HOST` / `API_PORT` | `0.0.0.0` / `8000` | Server bind address. |
+| `CORS_ORIGINS` | `http://localhost:5173` | Comma-separated allowed origins (Vite dev server). |
 
-See `INTEGRATION_GUIDE.md` for the full API contract.
+Credentials are read by boto3 from the standard chain (env vars, `~/.aws`,
+SSO, instance role) — you usually do **not** put keys in `.env`.
+
+---
+
+## Getting started with AWS
+
+1. **Credentials:** Run `aws sso login` or `aws configure`. boto3 reads the
+   standard chain automatically.
+2. **Enable Bedrock model access:** AWS console → Bedrock → *Model access* →
+   request the model(s) you will use (e.g., Claude).
+3. **Confirm the model id:** Copy the exact id from the console into
+   `BEDROCK_MODEL_ID` (often an inference-profile id prefixed `us.`).
+4. **Pick a region** where Bedrock, Knowledge Bases, Guardrails, and your model
+   are available. Set `AWS_REGION`.
+5. **Create the S3 bucket** and set `S3_BUCKET`.
+6. **Restart the backend.** DynamoDB table and IAM role are auto-provisioned on
+   first request.
+
+---
+
+## API endpoints
+
+**Health / metadata**
+
+| Method | Path | Purpose |
+|--------|------|---------|
+| GET | `/api/health` | Status. |
+| GET | `/api/industries` | Known industries (from the context-pack catalog in S3). |
+| GET | `/api/context-packs/stages` | Ordered generation stage labels. |
+
+**Read packs**
+
+| Method | Path | Purpose |
+|--------|------|---------|
+| GET | `/api/context-packs?industry=&agent_name=` | Pack versions for an industry (optionally filtered by agent name). |
+| GET | `/api/agent-names?industry=` | List of unique agent names for an industry. |
+| GET | `/api/context-packs/{pack_id}` | A single pack from S3. |
+| GET | `/api/context-packs/{pack_id}/system-prompt` | Both generic (before) and adapted (after) system prompts. |
+
+**Create flow (draft → approve)**
+
+| Method | Path | Purpose |
+|--------|------|---------|
+| POST | `/api/context-packs/upload-kb` | Upload KB files for an industry/usecase (stored in S3). |
+| POST | `/api/context-packs/check-name` | Check whether a name already exists. |
+| POST | `/api/context-packs/generate` | Generate a draft pack; returns the draft for review. |
+| PUT | `/api/context-packs/{draft_id}/draft` | Save edits + re-validate; returns `{pack, system_prompt, gaps}`. |
+| POST | `/api/context-packs/{draft_id}/approve` | Approve; **SSE stream** of `{step, status, detail}` then terminal `{step:"done", status, pack}`. |
+| DELETE | `/api/context-packs/{draft_id}` | Reject/discard the draft (deleted from S3). |
+
+**Chat**
+
+| Method | Path | Purpose |
+|--------|------|---------|
+| POST | `/api/chat/session` | Start a new chat session (stored in DynamoDB). |
+| GET | `/api/chat/sessions` | Recent sessions (sidebar resume list). |
+| GET | `/api/chat/session/{id}` | Full history of a session from DynamoDB. |
+| DELETE | `/api/chat/session/{id}` | Reset/clear a session. |
+| POST | `/api/chat/compare` | Before/after answer for one question + LLM evaluation + latency. |
+
+---
+
+## Approval: SSE step sequence
+
+Approving a draft emits one `in_progress` event and one terminal
+`succeeded`/`failed` event per step, in this order:
+
+1. **`s3`** — Finalise meta, merge industry-common ontology, save the pack to S3
+   (the context-pack version file is the single source of truth).
+2. **`guardrail`** — Create the Bedrock Guardrail from the pack; write
+   `guardrail_id` / `guardrail_version` into `pack.integrations`.
+3. **`kb`** — Provision a managed Bedrock Knowledge Base over the uploaded
+   files and ingest. **Non-fatal:** a KB failure does not abort approval.
+4. **`prompt`** — Create the Bedrock Prompt Management resource; write
+   `prompt_id` into `pack.integrations`.
+
+A final `{step:"done", status, pack}` event carries the committed pack.
+
+---
+
+## AWS resources created + scoping
+
+Approval provisions **per-industry/usecase** AWS resources:
+
+- **Amazon S3** — Context packs at `context-pack/{industry}/{usecase}/vN.json`;
+  ontology at `industry-docs/{industry}/ontology/vN.json`; uploaded files at
+  `industry-docs/{industry}/{usecase}/uploaded_data/`; drafts at `_drafts/{draft_id}.json`.
+- **Amazon Bedrock** — Foundation Model (via Converse/Strands), a **Guardrail**,
+  a **Prompt Management** resource, and a managed **Knowledge Base** (with an S3
+  data source scoped to that usecase's `uploaded_data/` prefix).
+- **Amazon DynamoDB** — `vaa-sessions` table for chat sessions with TTL-based
+  auto-expiration.
+- **AWS IAM** — A reusable KB execution role (`vaa-bedrock-kb-role`) the app
+  self-provisions once (idempotent).
+- **Amazon CloudWatch** — Structured JSON logs with request IDs and latency.
+
+The KB, guardrail, and prompt are scoped per industry/usecase. The KB's S3 data
+source is limited to `industry-docs/{industry}/{usecase}/uploaded_data/`.
+Switching industry loads a different pack with its own resource ids — there is
+**no cross-industry reuse**. Resource ids are persisted into `pack.integrations`.

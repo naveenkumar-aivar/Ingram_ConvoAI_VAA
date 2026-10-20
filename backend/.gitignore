@@ -1,0 +1,6 @@
+# Python / local dev artifacts
+__pycache__/
+*.pyc
+.venv/
+.env
+*.log

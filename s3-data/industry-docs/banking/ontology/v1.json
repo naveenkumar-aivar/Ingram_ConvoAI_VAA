@@ -1,9 +1,0 @@
-{
-  "terms": [
-    { "term": "APR", "definition": "Annual Percentage Rate — the yearly cost of a loan including interest and most fees." },
-    { "term": "Overdraft", "definition": "Withdrawing more money than the available account balance." },
-    { "term": "Wire Transfer", "definition": "An electronic bank-to-bank transfer of funds." },
-    { "term": "Routing Number", "definition": "A nine-digit code identifying a financial institution." },
-    { "term": "Statement", "definition": "A periodic summary of account activity, balances, and fees." }
-  ]
-}
