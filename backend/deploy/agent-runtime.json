@@ -1,0 +1,20 @@
+{
+  "agentRuntimeName": "VerticalAdaptionAgent",
+  "agentRuntimeArtifact": {
+    "containerConfiguration": {
+      "containerUri": "455162169375.dkr.ecr.us-east-1.amazonaws.com/vertical-adaption-agent:latest"
+    }
+  },
+  "roleArn": "arn:aws:iam::455162169375:role/VerticalAdaptionAgentCoreRole",
+  "networkConfiguration": { "networkMode": "PUBLIC" },
+  "protocolConfiguration": { "serverProtocol": "HTTP" },
+  "description": "Vertical Adaptation Agent — conversational + pack-generator agent.",
+  "environmentVariables": {
+    "AWS_REGION": "us-east-1",
+    "BEDROCK_MODEL_ID": "us.anthropic.claude-haiku-4-5-20251001-v1:0",
+    "S3_BUCKET": "vertical-adaption-agent",
+    "CONTEXT_PACK_PREFIX": "context-pack/",
+    "INDUSTRY_DOCS_PREFIX": "industry-docs/",
+    "AGENT_MODE": "local"
+  }
+}

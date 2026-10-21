@@ -1,0 +1,3 @@
+# Lambda dependencies — only the AWS SDK is needed to invoke AgentCore.
+# boto3 is present in the Lambda runtime, but pin it for local packaging/tests.
+boto3>=1.35

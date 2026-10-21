@@ -1,0 +1,26 @@
+{
+  "Version": "2012-10-17",
+  "Statement": [
+    {
+      "Sid": "Logs",
+      "Effect": "Allow",
+      "Action": ["logs:CreateLogGroup", "logs:CreateLogStream", "logs:PutLogEvents"],
+      "Resource": "arn:aws:logs:us-east-1:455162169375:*"
+    },
+    {
+      "Sid": "InvokeAgentCore",
+      "Effect": "Allow",
+      "Action": ["bedrock-agentcore:InvokeAgentRuntime"],
+      "Resource": [
+        "arn:aws:bedrock-agentcore:us-east-1:455162169375:runtime/VerticalAdaptionAgent-Km2rpv6ASP",
+        "arn:aws:bedrock-agentcore:us-east-1:455162169375:runtime/VerticalAdaptionAgent-Km2rpv6ASP/*"
+      ]
+    },
+    {
+      "Sid": "JobsTable",
+      "Effect": "Allow",
+      "Action": ["dynamodb:GetItem", "dynamodb:UpdateItem"],
+      "Resource": "arn:aws:dynamodb:us-east-1:455162169375:table/vaa-jobs"
+    }
+  ]
+}

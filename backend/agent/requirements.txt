@@ -1,0 +1,14 @@
+# Agent container dependencies (AgentCore Runtime image).
+# Kept minimal — no FastAPI/uvicorn here; the AgentCore SDK serves the HTTP.
+
+# Core data shapes
+pydantic>=2.10,<3.0
+pydantic-settings>=2.7,<3.0
+
+# AWS + agent (Strands Agents SDK)
+boto3>=1.35
+strands-agents>=1.61,<2.0
+strands-agents-tools>=0.8,<1.0
+
+# AgentCore runtime wrapper (serves /invocations + /ping on :8080)
+bedrock-agentcore
