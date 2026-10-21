@@ -50,3 +50,4 @@ samconfig.toml
 kb-data/
 s3-data/
 logs/
+.env

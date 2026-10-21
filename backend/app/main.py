@@ -147,8 +147,9 @@ def generate_draft(req: GenerateRequest) -> DraftResponse:
         name = req.name.strip()
         if not industry or not name:
             raise HTTPException(status_code=422, detail="industry and name are required.")
-        if get_store().name_exists(industry, name):
-            raise HTTPException(status_code=409, detail=f"'{name}' already exists for {industry}.")
+        
+        # Normalize name to lowercase to prevent case-variation duplicates
+        name = name.strip().lower()
 
         inp = BuildInput(
             industry=industry, use_case=req.use_case, name=name,

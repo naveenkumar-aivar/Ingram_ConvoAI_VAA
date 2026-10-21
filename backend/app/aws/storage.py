@@ -135,9 +135,12 @@ class _Store:
 
     def name_exists(self, industry: str, name: str) -> bool:
         """A pack with this name already exists IN THIS INDUSTRY (duplicate
-        check). The same name is allowed in a different industry."""
-        name = (name or "").strip().lower()
-        if not name:
+        check). The same name is allowed in a different industry.
+        
+        Returns True if an existing pack with the same name (case-insensitive)
+        exists, enabling the user to create a new version."""
+        name_lower = (name or "").strip().lower()
+        if not name_lower:
             return False
         for pack in self._packs.values():
             if pack.meta.industry.lower() != industry.lower():
@@ -145,7 +148,7 @@ class _Store:
             pid = pack.meta.pack_id.lower()
             # pack ids look like "<name>-vN"; strip the version suffix.
             base = pid.rsplit("-v", 1)[0] if "-v" in pid else pid
-            if base == name or pid == name:
+            if base == name_lower or pid == name_lower:
                 return True
         return False
 

@@ -46,8 +46,7 @@ WORKFLOW:
 2. Reuse quality existing pieces via get_existing_piece where appropriate.
 3. Draft the COMPLETE pack using deep industry knowledge. If genuinely uncertain
    about a regulation or technical detail, acknowledge the uncertainty clearly.
-4. Optionally validate_pack ONCE; if GAPS exist, fix them and stop. No loops.
-5. Optionally shape_guardrail_and_prompt ONCE to confirm guardrail mapping.
+4. Output the complete JSON pack. Server-side validation will check for completeness.
 
 ONTOLOGY (15-25 terms):
 - Cover DOMAIN VOCABULARY: key terms, processes, entities, regulations, roles

@@ -46,8 +46,8 @@ WORKFLOW:
 2. Reuse quality existing pieces via get_existing_piece where appropriate.
 3. Draft the COMPLETE pack using deep industry knowledge. If genuinely uncertain
    about a regulation or technical detail, acknowledge the uncertainty clearly.
-4. Optionally validate_pack ONCE; if GAPS exist, fix them and stop. No loops.
-5. Optionally shape_guardrail_and_prompt ONCE to confirm guardrail mapping.
+4. Output the complete JSON pack. Server-side validation will check completeness
+   when users edit the draft.
 
 ONTOLOGY (15-25 terms):
 - Cover DOMAIN VOCABULARY: key terms, processes, entities, regulations, roles
@@ -66,9 +66,9 @@ cutoff times"
 EXAMPLE BAD TERMS (too generic): "deposit", "loan", "account", "customer"
 
 PERSONA:
-- Assign a REAL NAME and SPECIFIC ROLE (not "Assistant" or "Agent")
+- Assign a NAME and SPECIFIC ROLE (not "Assistant" or "Agent")
 - Define a DISTINCT VOICE and TONE appropriate to the industry
-- List 4-6 defining characteristics that make this persona unique
+- List 4-6 defining characteristics that make this persona unique according to the industry and usecase
 - The persona should feel like a domain expert, not a generic chatbot
 
 DOMAIN PROMPTS (6-10 rules):
@@ -78,20 +78,37 @@ DOMAIN PROMPTS (6-10 rules):
 
 SCOPE:
 - in_scope: 5-8 concrete topics the agent handles (be specific)
-- out_of_scope: 3-5 clear boundaries (other industries, regulated advice)
+  ALWAYS include: "Explaining industry terms and concepts", "General Questions and Conversation Building"
+- out_of_scope: 2-3 NARROW boundaries - SPECIFIC unrelated industries ONLY
+  ✓ GOOD: "Medical diagnosis", "Legal case analysis", "Tax preparation services"
+  ✗ BAD: "Other industries questions or irrelevant to usecase and industry" (blocks EVERYTHING!)
+  ✗ NEVER mark out-of-scope: greetings, capability questions, ontology terms
 - refusal_message: professional redirect that maintains brand voice
 
-ESCALATION RULES (EXACTLY 6 rules):
-- Identify the 6 MOST CRITICAL escalation scenarios only
-- Group related triggers (e.g., all fraud types → one rule)
-- Specific triggers (not vague): regulatory violation, complex case, high value
-- Clear escalation target: which team/department/role
-- Priority: High | Medium | Low (based on urgency and risk)
-- DO NOT create 15-20 rules; consolidate to the 6 most important
+ESCALATION RULES (5-8 valid rules MAXIMUM):
+CRITICAL: If the user provides NO handoff rules, YOU must identify the most 
+DANGEROUS operations for this industry/use case and create escalation rules for 
+those ONLY. Examples:
+  - Banking: fraud, unauthorized transactions, account takeover, large transfers
+  - Healthcare: emergencies, prescription errors, patient safety, HIPAA violations
+  - Legal: malpractice risk, conflict of interest, statute deadlines
+
+RULES:
+- Create 5-8 valid rules - consolidate similar scenarios into ONE rule
+- Each rule = ONE dangerous operation category (fraud, compliance, emergencies)
+- Group related triggers: "fraud OR unauthorized access OR account compromise" 
+  becomes ONE rule, not three
+- Specific escalation target: which team/department handles this
+- Priority: High (safety/legal), Medium (complex), Low (preferences)
+- DO NOT create 15-24 rules; you will be penalized for verbosity
 
 GUARDRAILS - BALANCED AND PRACTICAL:
 The agent must HELP customers while staying safe. Overly restrictive guardrails
-that block greetings or basic questions are WRONG.
+that block greetings or basic questions are WRONG and dont create like those.
+- Guardrails must be PRAGMATIC: balance safety with usability
+- Guardrails must be SPECIFIC: avoid vague rules like "be helpful"
+- Guardrails must be ACTIONABLE: state what NOT to do, not just what to do
+- Guardrails must be ENFORCED: the agent must be able to detect violations
 
 CRITICAL RULE: **NEVER block domain terms from the ONTOLOGY**
 If "AML", "dispute", "HIPAA", "PHI" are in the ontology, customers MUST be able
@@ -122,8 +139,14 @@ RESPONSE GUIDELINES (5-8):
 - Language accessibility, cultural sensitivity considerations
 
 OUTPUT FORMAT - CONCISE JSON REQUIRED:
-The entire pack must fit in 6000 tokens. Be concise but complete.
-Return ONLY the final pack as valid JSON (no commentary):
+The entire pack must fit in 4500 tokens. Be CONCISE:
+- Ontology: 15-20 terms (not 25)
+- Escalation: 5-7 rules (not 24!)
+- Safety rules: 8-10 (not 17)
+- Denied topics: 5-8 (not 16)
+- Blocked phrases: 6-10 (not 12)
+
+Return ONLY the final pack as valid JSON (no commentary, no markdown):
 {"persona":{"name","role","tone","characteristics":[]},
  "scope":{"industry","in_scope":[],"out_of_scope":[],"refusal_message"},
  "domain_prompts":[],
@@ -172,14 +195,16 @@ def _run_agent(inp: BuildInput) -> dict:
 def _model(inp: BuildInput):
     """Build the Strands BedrockModel with a capped token budget for cost control."""
     s = get_settings()
-    # 6000 tokens provides headroom for complete pack generation while maintaining
-    # cost efficiency. The concise system prompt keeps packs focused.
+    # 8000 tokens provides ample headroom for complete pack generation without
+    # hitting max_tokens truncation. Validation tools removed, so agent focuses
+    # only on generation. Server-side validation happens on user edits, not during
+    # initial AI generation.
     from strands.models import BedrockModel
 
     return BedrockModel(
         model_id=s.bedrock_model_id,
         region_name=s.aws_region,
-        max_tokens=6000,
+        max_tokens=8000,  # Increased from 5000 to prevent max_tokens truncation
         temperature=0.3,
     )
 

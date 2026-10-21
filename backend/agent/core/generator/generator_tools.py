@@ -115,4 +115,9 @@ def shape_guardrail_and_prompt(pack_json: str) -> str:
 # text, so the agent wasted tokens calling it and often hit the max_tokens
 # truncation (which triggered the deterministic fallback). The model already
 # has strong industry knowledge; it grounds packs from that directly.
-GENERATOR_TOOLS = [list_existing_pieces, get_existing_piece, validate_pack, shape_guardrail_and_prompt]
+# NOTE: validate_pack and shape_guardrail_and_prompt were removed — they consumed
+# significant tokens and triggered max_tokens truncation during generation. Pack
+# validation now happens server-side ONLY when users edit the draft, not during
+# initial AI generation. This allows the agent to focus solely on generating
+# high-quality packs without token waste.
+GENERATOR_TOOLS = [list_existing_pieces, get_existing_piece]

@@ -550,7 +550,7 @@ function CreatePack({ onApprovalSuccess }) {
     return () => { active = false }
   }, [form.industry, form.name])
 
-  const canGenerate = form.industry.trim() && form.name.trim() && !nameTaken
+  const canGenerate = form.industry.trim() && form.name.trim()
 
   async function generate(e) {
     e.preventDefault()
@@ -697,7 +697,7 @@ function CreatePack({ onApprovalSuccess }) {
                 <label>Name *</label>
                 <input placeholder="e.g. support, wealth-desk" value={form.name}
                   onChange={(e) => set('name', e.target.value)} />
-                {nameTaken && <span className="warn-inline">This name already exists for {form.industry}.</span>}
+                {nameTaken && <span className="warn-inline">📦 Existing pack found. A new version will be created when approved.</span>}
               </div>
             </div>
 
@@ -741,7 +741,9 @@ function CreatePack({ onApprovalSuccess }) {
 
             {error && <div className="err">{error}</div>}
 
-            <button className="submit" type="submit" disabled={!canGenerate}>Generate with agent</button>
+            <button className="submit" type="submit" disabled={!canGenerate}>
+              {nameTaken ? "Generate New Version" : "Generate with agent"}
+            </button>
           </form>
         )}
 
