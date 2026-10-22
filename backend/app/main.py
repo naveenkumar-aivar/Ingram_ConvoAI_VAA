@@ -121,14 +121,14 @@ async def upload_kb(industry: str = Form(...), name: str = Form(...),
     """Store uploaded knowledge-base files for (industry, name). The files are
     ingested into the vector store when the pack is approved. Returns the
     stored filenames to echo back into the generate request."""
-    from app.aws.knowledge_base import save_upload
+    from app.aws.s3_manager import get_s3_manager
     if not industry.strip() or not name.strip():
         raise HTTPException(status_code=422, detail="industry and name are required.")
     saved: list[str] = []
     for f in files:
         data = await f.read()
-        if data:
-            saved.append(save_upload(industry, name, f.filename, data))
+        if data and get_s3_manager().save_uploaded_file(industry, name, f.filename, data):
+            saved.append(f.filename)
     return {"saved": saved}
 
 
@@ -254,8 +254,16 @@ def reject_draft(draft_id: str) -> dict:
 
 # ---------------------------------------------------------------- chat
 @app.post("/api/chat/session")
-def new_session() -> dict:
-    return {"session_id": get_sessions().new_session()}
+def new_session(pack_id: str = "", industry: str = "") -> dict:
+    sessions = get_sessions()
+    sid = sessions.new_session(pack_id=pack_id, industry=industry)
+    session_item = sessions._get_item(sid)
+    return {
+        "session_id": sid,
+        "pack_id": session_item.get("pack_id", "") if session_item else "",
+        "industry": session_item.get("industry", "") if session_item else "",
+        "created_at": session_item.get("created_at", 0) if session_item else 0,
+    }
 
 
 @app.get("/api/chat/sessions")

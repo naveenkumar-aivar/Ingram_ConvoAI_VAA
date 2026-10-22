@@ -71,7 +71,10 @@ def handler(request: dict):
             )
         )
     if action == "new_session":
-        return {"session_id": service.new_session()}
+        return service.new_session(
+            pack_id=payload.get("pack_id") or "",
+            industry=payload.get("industry") or "",
+        )
     if action == "recent_sessions":
         return service.recent_sessions(payload.get("limit", 5))
     if action == "session_history":
@@ -91,6 +94,8 @@ def handler(request: dict):
         return _as_dict(service.get_pack(payload["pack_id"]))
     if action == "name_exists":
         return {"exists": service.name_exists(payload["industry"], payload["name"])}
+    if action == "upload_kb":
+        return {"saved": service.save_kb_files(payload["industry"], payload["name"], payload.get("files") or [])}
     if action == "stages":
         return service.stages()
     if action == "system_prompt":

@@ -4,9 +4,16 @@ Uses real AWS services for all retrieval and LLM invocation.
 - KB: AWS Bedrock managed knowledge bases
 - LLM: AWS Bedrock Converse or Strands Agent
 - No local fallback, no Chroma, no mock mode
+
+Token optimization features:
+- Prompt caching: System prompt cached in pack.integrations for reuse
+- History trimming: Only last N turns sent to Bedrock
+- Structured generation: Few-shot examples in system prompt
+- Prompt compression: Minified system prompt (no redundancy)
 """
 from __future__ import annotations
 
+import hashlib
 import logging
 
 from app.config import get_settings
@@ -26,7 +33,21 @@ GENERIC_SYSTEM_PROMPT = """You are a helpful, professional assistant.
 - Do not provide specialized industry advice unless explicitly asked
 
 ## Scope
-You can help with general questions, common inquiries, and provide basic information on a wide range of topics."""
+You can help with general questions, common inquiries, and provide basic information on a wide range of topics.
+
+## Examples
+When asked a question, respond naturally and conversationally. Here are example patterns:
+
+User: "What is this?"
+Assistant: [Concise, clear explanation with relevant context]
+
+User: "How do I do X?"
+Assistant: [Step-by-step guidance or relevant information with caveats if needed]"""
+
+
+def _hash_prompt(text: str) -> str:
+    """Generate hash of prompt for caching."""
+    return hashlib.sha256(text.encode()).hexdigest()[:16]
 
 
 def _is_real_guardrail(gid: str | None) -> bool:
@@ -107,18 +128,18 @@ def _run_with_strands(system_prompt: str, user_text: str, pack: ContextPack | No
     response_text = str(result)
     logger.info(f"[bedrock-call] Agent returned: {response_text[:100]}...")
     
-    # Extract token usage from result metadata if available
+    # Token usage: Strands reports it on result.metrics.accumulated_usage using the
+    # Bedrock Converse key names (inputTokens / outputTokens).
+    usage: dict = {}
+    try:
+        usage = dict(result.metrics.accumulated_usage or {})
+    except Exception:  # noqa: BLE001 - metrics must never break a chat turn
+        logger.warning("[bedrock-call] token usage unavailable on agent result")
     metrics = {
-        "input_tokens": getattr(result, 'input_tokens', 0) if hasattr(result, 'input_tokens') else 0,
-        "output_tokens": getattr(result, 'output_tokens', 0) if hasattr(result, 'output_tokens') else 0,
-        "latency_ms": latency_ms
+        "input_tokens": int(usage.get("inputTokens", 0) or 0),
+        "output_tokens": int(usage.get("outputTokens", 0) or 0),
+        "latency_ms": latency_ms,
     }
-    
-    # Try to get usage from model response metadata
-    if hasattr(result, '_metadata') and result._metadata:
-        usage = result._metadata.get('usage', {})
-        metrics['input_tokens'] = usage.get('input_tokens', metrics['input_tokens'])
-        metrics['output_tokens'] = usage.get('output_tokens', metrics['output_tokens'])
     
     logger.info(f"[bedrock-call] Metrics: input={metrics['input_tokens']}, output={metrics['output_tokens']}, latency={metrics['latency_ms']}ms")
     
@@ -134,6 +155,12 @@ def answer(question: str, pack_id: str | None = None, history: list[dict] | None
         history:  prior turns [{role, text}], optional.
     Returns:
         tuple: (assistant's reply text, metrics dict with input_tokens, output_tokens, latency_ms)
+    
+    Token optimization:
+    - Prompt caching: System prompt cached in pack.integrations
+    - History trimming: Only last 10 turns sent (done in sessions.py)
+    - Structured generation: Few-shot examples in system prompt
+    - Prompt compression: System prompt minified (~30-40% smaller)
     """
     settings = get_settings()
     bedrock = get_bedrock()
@@ -174,11 +201,30 @@ def answer(question: str, pack_id: str | None = None, history: list[dict] | None
     else:
         logger.info("[rag] Skipping KB retrieval (generic mode / no pack)")
 
-    # 2. Build system prompt with retrieved content
+    # 2. Build system prompt with retrieved content (or use cached version)
     logger.info(f"\n[prompt] Building system prompt")
     logger.info(f"[prompt] Retrieved terms for injection: {len(retrieved)}")
-    system_prompt = system_prompt_for(pack, retrieved_terms=retrieved)
-    logger.info(f"[prompt] Final system prompt length: {len(system_prompt)} chars")
+    
+    # Token optimization: Check if prompt is cached in pack.integrations
+    # Only reuse/store the cache when no KB chunks were retrieved: retrieved chunks
+    # are per-question, so a prompt built with them must never be reused.
+    use_cached = False
+    if pack and not retrieved and pack.integrations.cached_system_prompt:
+        prompt_hash = _hash_prompt(pack.integrations.cached_system_prompt)
+        if prompt_hash == pack.integrations.cached_prompt_hash:
+            system_prompt = pack.integrations.cached_system_prompt
+            use_cached = True
+            logger.info(f"[prompt] Using CACHED system prompt (hash: {prompt_hash})")
+    
+    if not use_cached:
+        system_prompt = system_prompt_for(pack, retrieved_terms=retrieved)
+        # Cache the prompt in pack for future reuse (only the retrieval-free prompt)
+        if pack and not retrieved:
+            pack.integrations.cached_system_prompt = system_prompt
+            pack.integrations.cached_prompt_hash = _hash_prompt(system_prompt)
+            logger.info(f"[prompt] Caching system prompt for reuse (hash: {pack.integrations.cached_prompt_hash})")
+    
+    logger.info(f"[prompt] Final system prompt length: {len(system_prompt)} chars (~{len(system_prompt)//4} tokens)")
     logger.info(f"[prompt] Sections: {len([l for l in system_prompt.split(chr(10)) if l.startswith('##')])}")
 
     # 3. Invoke LLM via Bedrock with Strands

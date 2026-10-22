@@ -157,7 +157,12 @@ def _map_sync_action(method: str, path: str, qs: dict, body: dict) -> tuple[str,
     if path.endswith("/system-prompt") and method == "GET":
         return "system_prompt", {"pack_id": path.split("/")[-2]}
     if path.endswith("/api/chat/session") and method == "POST":
-        return "new_session", {}
+        # Same contract as the local FastAPI route: optional pack_id/industry
+        # (query string or JSON body) stamp the session with its own industry.
+        return "new_session", {
+            "pack_id": qs.get("pack_id") or body.get("pack_id") or "",
+            "industry": qs.get("industry") or body.get("industry") or "",
+        }
     if path.endswith("/api/chat/sessions") and method == "GET":
         return "recent_sessions", {}
     if "/api/chat/session/" in path and method == "GET":
@@ -175,16 +180,119 @@ def _map_sync_action(method: str, path: str, qs: dict, body: dict) -> tuple[str,
     return None
 
 
+# API Gateway caps the request at 10 MB and Lambda's synchronous payload at 6 MB;
+# base64 inflates by ~33%, so keep decoded uploads comfortably under that.
+_MAX_UPLOAD_BYTES = 4 * 1024 * 1024
+
+
+def _parse_multipart(event: dict) -> tuple[dict, list[dict]]:
+    """Parse a multipart/form-data API Gateway event into (fields, files).
+
+    files -> [{"filename", "content_b64"}]. Uses only the stdlib so the Lambda
+    package needs no extra dependencies.
+    """
+    import base64
+    from email import policy
+    from email.parser import BytesParser
+
+    headers = {k.lower(): v for k, v in (event.get("headers") or {}).items()}
+    ctype = headers.get("content-type", "")
+    raw = event.get("body") or ""
+    data = base64.b64decode(raw) if event.get("isBase64Encoded") else raw.encode("utf-8")
+    if len(data) > _MAX_UPLOAD_BYTES:
+        raise ValueError("TOO_LARGE")
+    msg = BytesParser(policy=policy.default).parsebytes(
+        b"Content-Type: " + ctype.encode("utf-8") + b"\r\nMIME-Version: 1.0\r\n\r\n" + data
+    )
+    fields: dict = {}
+    files: list[dict] = []
+    for part in msg.iter_parts():
+        name = part.get_param("name", header="content-disposition")
+        filename = part.get_filename()
+        payload = part.get_payload(decode=True) or b""
+        if filename is not None:
+            files.append({"filename": filename, "content_b64": base64.b64encode(payload).decode("ascii")})
+        elif name:
+            fields[name] = payload.decode("utf-8", "replace")
+    return fields, files
+
+
+def _handle_upload_kb(event: dict) -> dict:
+    """POST /api/context-packs/upload-kb (multipart) -> {"saved": [filenames]}.
+
+    Same contract as the local FastAPI route. Parsed here (the body is binary,
+    not JSON) and stored by the agent's ``upload_kb`` action, whose role already
+    has S3 access.
+    """
+    try:
+        fields, files = _parse_multipart(event)
+    except ValueError as exc:
+        if str(exc) == "TOO_LARGE":
+            return _resp(413, {"detail": f"Upload exceeds {_MAX_UPLOAD_BYTES // (1024 * 1024)} MB limit."})
+        return _resp(400, {"detail": f"Invalid multipart body: {exc}"})
+    except Exception as exc:  # noqa: BLE001
+        logger.exception("multipart parse failed")
+        return _resp(400, {"detail": f"Invalid multipart body: {exc}"})
+    industry = (fields.get("industry") or "").strip()
+    name = (fields.get("name") or "").strip()
+    if not industry or not name:
+        return _resp(422, {"detail": "industry and name are required."})
+    try:
+        result = _invoke_agentcore("upload_kb", {"industry": industry, "name": name, "files": files})
+    except Exception as exc:  # noqa: BLE001
+        logger.exception("upload_kb AgentCore invocation failed")
+        return _resp(502, {"detail": f"Agent runtime error: {exc}"})
+    return _resp(200, result)
+
+
+def _handle_presigned_url(event: dict, qs: dict) -> dict:
+    """GET /api/context-packs/upload-kb/presigned -> {url, expires_in}.
+
+    Generates a presigned S3 PUT URL for direct file upload (bypasses Lambda 4 MB limit).
+    Query params: industry, name, filename, expires_in (optional, default 3600).
+    """
+    industry = (qs.get("industry") or "").strip()
+    name = (qs.get("name") or "").strip()
+    filename = (qs.get("filename") or "").strip()
+    expires_in = int(qs.get("expires_in") or 3600)
+    
+    if not industry or not name or not filename:
+        return _resp(422, {"detail": "industry, name, and filename are required."})
+    
+    expires_in = max(1, min(expires_in, 604800))  # Cap: 1 second to 7 days
+    
+    try:
+        result = _invoke_agentcore("presigned_upload_url", {
+            "industry": industry,
+            "name": name,
+            "filename": filename,
+            "expires_in": expires_in,
+        })
+        return _resp(200, result)
+    except Exception as exc:  # noqa: BLE001
+        logger.exception("presigned_upload_url AgentCore invocation failed")
+        return _resp(502, {"detail": f"Agent runtime error: {exc}"})
+
+
 def _handle_api(event: dict) -> dict:
     method = _method(event)
     path = _path(event)
     qs = event.get("queryStringParameters") or {}
-    body = _body(event)
 
     if method == "OPTIONS":
         return _resp(200, {"ok": True})
     if not _RUNTIME_ARN:
         return _resp(500, {"detail": "AGENT_RUNTIME_ARN not configured"})
+
+    # Multipart upload: must run BEFORE _body(), which assumes a UTF-8 JSON body.
+    if path.endswith("/api/context-packs/upload-kb") and method == "POST":
+        return _handle_upload_kb(event)
+
+    # Presigned URL generation: GET before multipart (handles query string only)
+    if path.endswith("/api/context-packs/upload-kb/presigned") and method == "GET":
+        return _handle_presigned_url(event, qs)
+
+    body = _body(event)
 
     # GET /api/jobs/{job_id} : poll
     if "/api/jobs/" in path and method == "GET":

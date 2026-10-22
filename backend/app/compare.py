@@ -51,10 +51,24 @@ def compare(
         adapted_duration_ms = 0
 
     # Persist the new turn so the next question remembers this one.
+    # Extract token metrics and pass them to append_turn for cumulative tracking.
     if session_id:
-        sessions.append_turn(session_id, "generic", question, generic_text)
+        generic_input_tokens = int(generic_metrics.get('input_tokens', 0))
+        generic_output_tokens = int(generic_metrics.get('output_tokens', 0))
+        adapted_input_tokens = int(adapted_metrics.get('input_tokens', 0))
+        adapted_output_tokens = int(adapted_metrics.get('output_tokens', 0))
+        
+        sessions.append_turn(session_id, "generic", question, generic_text, input_tokens=generic_input_tokens, output_tokens=generic_output_tokens)
         if pack_id:
-            sessions.append_turn(session_id, "adapted", question, adapted_text)
+            sessions.append_turn(session_id, "adapted", question, adapted_text, input_tokens=adapted_input_tokens, output_tokens=adapted_output_tokens)
+        
+        # Fetch updated session item to get cumulative totals
+        session_item = sessions._get_item(session_id)
+        session_total_input = int(session_item.get("total_input_tokens", 0)) if session_item else 0
+        session_total_output = int(session_item.get("total_output_tokens", 0)) if session_item else 0
+    else:
+        session_total_input = 0
+        session_total_output = 0
 
     # Evaluate both responses (if a pack is applied).
     evaluation = []
@@ -104,4 +118,10 @@ def compare(
         adapted_output_tokens=adapted_metrics.get('output_tokens', 0),
         generic_latency_ms=generic_metrics.get('latency_ms', 0),
         adapted_latency_ms=adapted_metrics.get('latency_ms', 0),
+        session_total_input_tokens=session_total_input,
+        session_total_output_tokens=session_total_output,
+        # Same basis as session_total_*: both bots' usage for this question
+        # (the adapted bot only runs when a pack is applied).
+        current_turn_input_tokens=int(generic_metrics.get('input_tokens', 0)) + (int(adapted_metrics.get('input_tokens', 0)) if pack_id else 0),
+        current_turn_output_tokens=int(generic_metrics.get('output_tokens', 0)) + (int(adapted_metrics.get('output_tokens', 0)) if pack_id else 0),
     )

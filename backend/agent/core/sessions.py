@@ -27,6 +27,7 @@ import json
 import logging
 import time
 import uuid
+from decimal import Decimal
 from pathlib import Path
 
 from agent.config import get_settings
@@ -34,9 +35,21 @@ from agent.config import get_settings
 logger = logging.getLogger(__name__)
 
 # Trim stored history so prompts stay small (last N turns per side).
-MAX_TURNS_PER_SIDE = 20
+# Token optimization: Keep only last N turns to reduce input tokens
+MAX_TURNS_PER_SIDE = 10  # Reduced from 20 for better token savings
 # Each exchange is two entries (user + assistant).
 _MAX_ENTRIES_PER_SIDE = MAX_TURNS_PER_SIDE * 2
+
+
+def _plain(obj):
+    """Recursively convert DynamoDB Decimals to int/float so results are JSON-safe."""
+    if isinstance(obj, Decimal):
+        return int(obj) if obj == obj.to_integral_value() else float(obj)
+    if isinstance(obj, dict):
+        return {k: _plain(v) for k, v in obj.items()}
+    if isinstance(obj, list):
+        return [_plain(v) for v in obj]
+    return obj
 
 
 def _preview_and_turns(data: dict) -> tuple[str, int]:
@@ -123,7 +136,7 @@ class _DynamoSessionStore:
     def _expires_at(self) -> int:
         return self._now() + self.settings.session_ttl_days * 86400
 
-    def _empty_item(self, session_id: str) -> dict:
+    def _empty_item(self, session_id: str, pack_id: str = "", industry: str = "") -> dict:
         now = self._now()
         return {
             "session_id": session_id,
@@ -133,6 +146,11 @@ class _DynamoSessionStore:
             "preview": "",
             "user_turns": 0,
             "expires_at": self._expires_at(),
+            "pack_id": pack_id,
+            "industry": industry,
+            "created_at": now,
+            "total_input_tokens": 0,
+            "total_output_tokens": 0,
         }
 
     def _get_item(self, session_id: str) -> dict | None:
@@ -148,42 +166,100 @@ class _DynamoSessionStore:
             return None
 
     # -- public API ----------------------------------------------------------
-    def new_session(self) -> str:
+    def new_session(self, pack_id: str = "", industry: str = "") -> str:
         sid = uuid.uuid4().hex
         try:
-            self._get_table().put_item(Item=self._empty_item(sid))
+            self._get_table().put_item(Item=self._empty_item(sid, pack_id=pack_id, industry=industry))
         except Exception as exc:  # noqa: BLE001 — a failed persist must not break
             logger.warning(f"[sessions] new_session put failed (non-fatal): {exc}")
         return sid
 
-    def get_history(self, session_id: str, side: str) -> list[dict]:
-        """Return prior turns for one side ('generic' or 'adapted')."""
+    def get_history(self, session_id: str, side: str, max_turns: int | None = None) -> list[dict]:
+        """Return prior turns for one side ('generic' or 'adapted').
+        
+        Token optimization: Trim to max_turns exchanges to keep input tokens under control.
+        If max_turns is None, uses MAX_TURNS_PER_SIDE (default 10 turns = 20 entries).
+        
+        Args:
+            session_id: session identifier
+            side: "generic" or "adapted"
+            max_turns: max exchanges (None = use MAX_TURNS_PER_SIDE)
+        
+        Returns:
+            list[dict] with {role, text}, trimmed to max_turns exchanges
+        """
+        if max_turns is None:
+            max_turns = MAX_TURNS_PER_SIDE
+        
         item = self._get_item(session_id)
         if not item:
             return []
-        return list(item.get(side) or [])
+        
+        hist = list(item.get(side) or [])
+        max_entries = max_turns * 2  # Each turn is 2 entries (user + assistant)
+        
+        if len(hist) > max_entries:
+            hist = hist[-max_entries:]
+            logger.debug(f"[sessions] Trimmed history to last {max_turns} turns ({len(hist)} entries)")
+        
+        return hist
 
-    def append_turn(self, session_id: str, side: str, user_text: str, assistant_text: str) -> None:
+    def append_turn(self, session_id: str, side: str, user_text: str, assistant_text: str, input_tokens: int = 0, output_tokens: int = 0) -> None:
+        """Add a turn to the conversation history with optional token tracking.
+        
+        Token optimization: Automatically trims history to MAX_TURNS_PER_SIDE exchanges
+        (20 entries total: 10 user + 10 assistant) to keep input tokens under control.
+        
+        Args:
+            session_id: session identifier
+            side: "generic" or "adapted"
+            user_text: user message
+            assistant_text: assistant response
+            input_tokens: input tokens used in this turn (optional)
+            output_tokens: output tokens used in this turn (optional)
+        """
         if not session_id:
             return
         item = self._get_item(session_id) or self._empty_item(session_id)
+        
+        # Ensure backward compatibility: add missing metadata fields if they don't exist
+        if "pack_id" not in item:
+            item["pack_id"] = ""
+        if "industry" not in item:
+            item["industry"] = ""
+        if "created_at" not in item:
+            item["created_at"] = self._now()
+        if "total_input_tokens" not in item:
+            item["total_input_tokens"] = 0
+        if "total_output_tokens" not in item:
+            item["total_output_tokens"] = 0
+        
         hist = list(item.get(side) or [])
-        hist.append({"role": "user", "text": user_text})
-        hist.append({"role": "assistant", "text": assistant_text})
+        now = self._now()
+        hist.append({"role": "user", "text": user_text, "timestamp": now})
+        hist.append({"role": "assistant", "text": assistant_text, "input_tokens": input_tokens, "output_tokens": output_tokens, "timestamp": now})
         # keep only the last MAX_TURNS_PER_SIDE exchanges (2 entries each)
+        # Token optimization: Aggressive trimming to reduce input tokens in Bedrock calls
         if len(hist) > _MAX_ENTRIES_PER_SIDE:
             hist = hist[-_MAX_ENTRIES_PER_SIDE:]
+            logger.debug(f"[sessions] Trimmed {side} history to last {MAX_TURNS_PER_SIDE} turns")
         item[side] = hist
         item["generic"] = list(item.get("generic") or [])
         item["adapted"] = list(item.get("adapted") or [])
+        
+        # Accumulate total input/output tokens
+        item["total_input_tokens"] = int(item["total_input_tokens"]) + input_tokens
+        item["total_output_tokens"] = int(item["total_output_tokens"]) + output_tokens
+        
         preview, user_turns = _preview_and_turns(item)
         item["preview"] = preview
         item["user_turns"] = user_turns
-        item["updated_at"] = self._now()
+        item["updated_at"] = now
         item["expires_at"] = self._expires_at()
         item["session_id"] = session_id
         try:
             self._get_table().put_item(Item=item)
+            logger.debug(f"[sessions] Appended turn to {session_id} ({side}), history now {len(hist)} entries, cumulative tokens: {item['total_input_tokens']} input, {item['total_output_tokens']} output")
         except Exception as exc:  # noqa: BLE001 — a failed persist must not break
             logger.warning(f"[sessions] append_turn put failed (non-fatal): {exc}")
 
@@ -196,7 +272,7 @@ class _DynamoSessionStore:
             logger.warning(f"[sessions] reset delete failed (non-fatal): {exc}")
 
     def recent(self, limit: int = 5) -> list[dict]:
-        """Most-recently-updated sessions with a short preview. A full Scan is
+        """Most-recently-updated sessions with a short preview and metadata. A full Scan is
         acceptable at demo scale; a GSI on (constant, updated_at) would be the
         production choice to avoid scanning the whole table."""
         try:
@@ -217,6 +293,11 @@ class _DynamoSessionStore:
                     "session_id": item.get("session_id"),
                     "preview": preview[:60],
                     "turns": turns,
+                    "pack_id": item.get("pack_id", ""),
+                    "industry": item.get("industry", ""),
+                    "created_at": int(item.get("created_at") or 0),
+                    "total_input_tokens": int(item.get("total_input_tokens") or 0),
+                    "total_output_tokens": int(item.get("total_output_tokens") or 0),
                     "_updated_at": int(item.get("updated_at") or 0),
                 }
             )
@@ -224,12 +305,20 @@ class _DynamoSessionStore:
         return out[:limit]
 
     def full_history(self, session_id: str) -> dict:
-        """Both sides' turns for resuming a conversation in the UI."""
+        """Both sides' turns for resuming a conversation in the UI, plus the
+        session metadata (industry/pack the session was created with, token totals)."""
         item = self._get_item(session_id) or {}
-        return {
-            "generic": list(item.get("generic") or []),
-            "adapted": list(item.get("adapted") or []),
-        }
+        return _plain(
+            {
+                "generic": list(item.get("generic") or []),
+                "adapted": list(item.get("adapted") or []),
+                "pack_id": item.get("pack_id", ""),
+                "industry": item.get("industry", ""),
+                "created_at": item.get("created_at", 0),
+                "total_input_tokens": item.get("total_input_tokens", 0),
+                "total_output_tokens": item.get("total_output_tokens", 0),
+            }
+        )
 
 
 _store: _DynamoSessionStore | None = None

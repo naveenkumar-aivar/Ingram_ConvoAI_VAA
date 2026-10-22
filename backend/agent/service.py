@@ -33,9 +33,40 @@ def compare(
     return _compare(question, pack_id, history, industry=industry, session_id=session_id)
 
 
-def new_session() -> str:
+def new_session(pack_id: str = "", industry: str = "") -> dict:
+    """Create a session stamped with the pack/industry it was started with, so
+    reopening it later shows its own industry (not the currently selected one)."""
     from agent.core.sessions import get_sessions
-    return get_sessions().new_session()
+
+    store = get_sessions()
+    sid = store.new_session(pack_id=pack_id or "", industry=industry or "")
+    item = store._get_item(sid) or {}
+    return {
+        "session_id": sid,
+        "pack_id": item.get("pack_id", pack_id or ""),
+        "industry": item.get("industry", industry or ""),
+        "created_at": int(item.get("created_at") or 0),
+    }
+
+
+def save_kb_files(industry: str, name: str, files: list[dict]) -> list[str]:
+    """Store uploaded knowledge-base files (``[{"filename", "content_b64"}]``) under
+    industry-docs/<industry>/<name>/uploaded_data/. Returns the saved filenames."""
+    import base64
+    import os
+
+    from agent.aws.s3_manager import get_s3_manager
+
+    if not (industry or "").strip() or not (name or "").strip():
+        raise ValueError("industry and name are required.")
+    s3 = get_s3_manager()
+    saved: list[str] = []
+    for f in files or []:
+        filename = os.path.basename(f.get("filename") or "")
+        data = base64.b64decode(f.get("content_b64") or "")
+        if filename and data and s3.save_uploaded_file(industry, name, filename, data):
+            saved.append(filename)
+    return saved
 
 
 def recent_sessions(limit: int = 5) -> list[dict]:
