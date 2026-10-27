@@ -244,14 +244,31 @@ function Panel({ kind, title, sub, turns, loading, pending, side }) {
         )}
         {turns.map((t, idx) => {
           const latency = side === 'generic' ? t.generic_duration_ms : t.adapted_duration_ms
+          const inputTokens = side === 'generic' ? t.generic_input_tokens : t.adapted_input_tokens
+          const outputTokens = side === 'generic' ? t.generic_output_tokens : t.adapted_output_tokens
           return (
             <div key={idx} className="exchange">
               <div className="msg user">{t.question}</div>
               <div className={`msg bot ${kind} md`} dangerouslySetInnerHTML={{ __html: renderMd(side === 'generic' ? t.generic : t.adapted) }} />
-              {latency != null && (
-                <div className="metrics-row">
-                  <span className="metric-label">Response time:</span>
-                  <span className="metric-value">{latency} ms</span>
+              <div className="metrics-row">
+                {latency != null && (
+                  <>
+                    <span className="metric-label">Response:</span>
+                    <span className="metric-value">{latency} ms</span>
+                  </>
+                )}
+                {inputTokens != null && outputTokens != null && (
+                  <>
+                    <span className="metric-sep">·</span>
+                    <span className="metric-label">Tokens:</span>
+                    <span className="metric-value">{inputTokens} in, {outputTokens} out</span>
+                  </>
+                )}
+              </div>
+              {(t.session_total_input_tokens != null || t.session_total_output_tokens != null) && (
+                <div className="metrics-row session-tokens">
+                  <span className="metric-label dim">Session total:</span>
+                  <span className="metric-value dim">{t.session_total_input_tokens || 0} in, {t.session_total_output_tokens || 0} out</span>
                 </div>
               )}
             </div>

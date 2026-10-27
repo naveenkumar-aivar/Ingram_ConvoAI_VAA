@@ -51,6 +51,7 @@ class PromptTemplateError(BedrockResourcesError):
 
 
 # PII token (as used in ContextPack.guardrails.pii_blocks) -> Bedrock PII entity type.
+# Comprehensive coverage: personal identifiers, financial, medical, authentication data.
 _PII_MAP = {
     "SSN": "US_SOCIAL_SECURITY_NUMBER",
     "EMAIL": "EMAIL",
@@ -58,6 +59,11 @@ _PII_MAP = {
     "CREDIT_CARD": "CREDIT_DEBIT_CARD_NUMBER",
     "NAME": "NAME",
     "ADDRESS": "ADDRESS",
+    "ACCOUNT_NUMBER": "CREDIT_DEBIT_CARD_NUMBER",  # Bank/financial account numbers
+    "DRIVER_LICENSE": "US_DRIVER_LICENSE_NUMBER",  # Driver's license
+    "PASSPORT": "PASSPORT_ID",  # Passport number
+    "IP_ADDRESS": "IP_ADDRESS",  # IPv4/IPv6 addresses
+    "MAC_ADDRESS": "MAC_ADDRESS",  # MAC addresses
 }
 
 # Bedrock topic names must match [0-9a-zA-Z-_ !?.]+ and be reasonably short.
@@ -167,11 +173,13 @@ class BedrockResourceManager:
             }
 
         # Sensitive-information policy — map known PII tokens, skip unknown.
+        # Action ANONYMIZE: mask PII in place (e.g., "123-45-6789" → "***-**-6789")
+        # This allows LLM to answer while protecting sensitive data.
         pii_entities = []
         for token in pii_blocks:
             mapped = _PII_MAP.get(token.strip().upper())
             if mapped:
-                pii_entities.append({"type": mapped, "action": "BLOCK"})
+                pii_entities.append({"type": mapped, "action": "ANONYMIZE"})
         if pii_entities:
             kwargs["sensitiveInformationPolicyConfig"] = {"piiEntitiesConfig": pii_entities}
 

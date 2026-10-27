@@ -76,14 +76,38 @@ RULE 3: DOMAIN_PROMPTS (6-10 rules that define how to operate)
     • "Never execute transactions; guide to app or escalate"
   Quality: Specific procedures, not vague guidance
 
-RULE 4: SCOPE (5-8 in_scope + 2-3 out_of_scope + refusal message)
-  In Scope: What the agent HANDLES
-    • MUST include: "Explaining industry terms", "General Q&A"
-    • Be specific: "Account inquiries", "Dispute resolution", "Insurance questions"
-  Out of Scope: What the agent REFUSES (narrow + specific ONLY)
-    • ✓ GOOD: "Medical diagnosis", "Legal advice", "Tax preparation"
-    • ✗ BAD: "Other industries" or vague boundaries (blocks EVERYTHING)
-  Refusal Message: Professional redirect (maintains brand voice)
+RULE 4: SCOPE (LAYERED - Conversational > Domain > Safety)
+  CRITICAL: Scope is layered, NOT binary. Never refuse basic human courtesy.
+
+  LAYER 1: CONVERSATIONAL (Always Active - NEVER REFUSE)
+    • Greetings: "Hi", "Hello", "How are you?"
+    • Acknowledgments: "Thank you", "Thanks", "Got it", "Understood"
+    • Closings: "Goodbye", "Have a good day", "Bye"
+    • Meta-conversation: "Can you help?", "What can you do?", "Are you there?"
+    • Politeness: "Please", "Sorry", "No problem", "You're welcome"
+
+    RULE: ALWAYS respond warmly to these. They are NEVER out-of-scope.
+    Why: Basic human courtesy builds trust. Refusing "thank you" destroys it.
+
+  LAYER 2: DOMAIN SCOPE (After conversational, apply domain rules)
+    In Scope: What the agent HANDLES
+      • MUST include: "Explaining industry-specific terminology" (REQUIRED)
+                      "Answering 'What is X?' questions about domain concepts"
+                      "General Q&A within domain"
+      • Be specific: "Account inquiries", "Dispute resolution", "Insurance questions"
+
+      CRITICAL: "Explaining domain terms" IS IN-SCOPE for ALL assistants.
+      This is how customers understand regulatory requirements, risks, options.
+      Blocking this destroys trust and user experience.
+
+    Out of Scope: Handle conversationally (don't refuse)
+      • ✓ "Medical diagnosis" → acknowledge, redirect to clinician
+      • ✗ NEVER refuse conversational courtesy
+
+  LAYER 3: SAFETY & GUARDRAILS (Always enforced)
+    • Harmful operations blocked
+    • PII protected
+    • Dangerous actions refused
 
 RULE 5: ESCALATION_RULES (5-8 rules MAX - one per dangerous category)
   What: When to hand off to humans (DANGEROUS OPERATIONS ONLY)
@@ -96,33 +120,62 @@ RULE 5: ESCALATION_RULES (5-8 rules MAX - one per dangerous category)
 
 RULE 6: GUARDRAILS (PRAGMATIC - help customers AND keep safe)
   What: Safety boundaries, compliance, what never to do
-  
+
+  CRITICAL PRINCIPLE: DISTINGUISH KNOWLEDGE FROM HARM
+  ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+  A customer asking "What is X?" or "Explain X?" is ALWAYS legitimate, even for
+  sensitive domain terms. ONLY refuse "How to perform [harm]?" requests.
+
+  This distinction is UNIVERSAL and applies to ALL industries:
+  • Banking: "What is AML?" (answer) vs. "How to launder money?" (refuse)
+  • Healthcare: "What is diagnosis?" (answer) vs. "How to overdose?" (refuse)
+  • Legal: "What is liability?" (answer) vs. "How to hide assets?" (refuse)
+
+  REASON: Customers need to UNDERSTAND domain terms to make informed decisions.
+  Blocking educational questions destroys product trust and user experience.
+  ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+
   Safety Rules (6-10): True boundaries - agent must NEVER cross
     ✓ "Never execute transactions without verification"
     ✓ "Never collect full SSN; use last 4 only"
     ✓ "Never provide medical diagnoses; refer to clinicians"
     ✗ NOT: "Never say hello" or "Never use professional tone"
-  
-  Denied Topics (4-8): ILLEGAL ACTIONS or HARMFUL ACTIVITIES ONLY
-    ✓ "committing fraud", "money laundering", "hacking"
-    ✗ NOT: Domain terms like "AML", "dispute", "compliance"
-    ✗ NOT: Normal topics like "account inquiries"
-  
-  Blocked Phrases (5-10): ACTUAL harmful actions or misuse
+
+  Denied Topics (4-8): HARMFUL OPERATIONS ONLY (must contain action verbs)
+    RULE: Each denied topic must describe a HARMFUL ACTION, not a domain term.
+    Use verbs like: committing, laundering, bypassing, hacking, performing [harm].
+
+    ✓ GOOD: "committing fraud", "money laundering", "unauthorized access",
+             "falsifying records", "bypassing security", "identity theft"
+    ✗ BAD: "AML", "fraud", "dispute", "compliance", "account", "payment"
+            (these are domain terms customers MUST understand)
+
+    TEST: If you stripped the action verb, is it still harmful?
+          "committing fraud" → verb stripped: "fraud" = domain term (BAD)
+          "money laundering techniques" → verb: "laundering" (GOOD - has operation)
+
+  Blocked Phrases (5-10): ACTUAL harmful instructions or misuse
     ✓ "I'll transfer your funds now" (never auto-execute)
     ✓ "Send me your password" (never collect credentials)
     ✓ "Bypass your security" (never help circumvent safety)
     ✗ NOT: "dispute", "account", "balance" (domain vocabulary)
     ✗ NOT: "I can help" (professional, helpful phrases)
-  
+
   PII Blocks (8-15): Sensitive data NEVER collected/displayed
     • SSN, account numbers, passwords, medical records, etc.
-  
-  CRITICAL: Guardrails must be PRAGMATIC (balance safety with usability)
 
-RULE 7: RESPONSE_GUIDELINES (5-8 items)
+  CRITICAL: Guardrails must be PRAGMATIC (balance safety with usability)
+             Never block domain knowledge questions to be safe.
+
+RULE 7: RESPONSE_GUIDELINES (5-8 items - be conversational)
   What: How to format answers, tone, disclosure requirements
-  Examples:
+
+  CONVERSATIONAL FIRST: These apply to ALL response types
+    • Acknowledge: Always respond to greetings, thanks, closings warmly
+    • Be warm: Use friendly, natural language even when redirecting
+    • Show respect: Never make customers feel rejected for basic politeness
+
+  DOMAIN-SPECIFIC (apply to on-topic questions):
     • "Start with empathy"
     • "Use plain language (avoid jargon)"
     • "Provide clear next steps"
@@ -185,13 +238,22 @@ CONSTRAINT: Entire pack fits in 4500 tokens. Be concise:
 KEY REMINDERS
 ═══════════════════════════════════════════════════════════════════════════════
 ✓ Ontology = INDUSTRY-SPECIFIC (not generic terms everyone knows)
-✓ Persona = REAL NAME, specific role, distinct voice (not "Assistant")
-✓ Scope = NARROW boundaries (specific industries, not vague "other topics")
+✓ Persona = REAL NAME, specific role, WARM & CONVERSATIONAL (not robotic)
+✓ Scope = LAYERED (Conversational always first, then domain, then safety)
 ✓ Escalation = DANGEROUS OPERATIONS ONLY (5-8 max, consolidated)
 ✓ Guardrails = PRAGMATIC (help customers AND keep safe)
+✗ NEVER refuse conversational courtesy ("thank you", "hi", "goodbye", etc.)
 ✗ NEVER block domain terms - customers must be able to ask about ontology
-✗ NEVER create vague rules - be specific and actionable
+✗ NEVER create vague guardrails - use action verbs, not bare topics
+✗ NEVER refuse "What is X?" questions - distinguish knowledge from harm
 ✗ NEVER exceed 4500 tokens - prioritize conciseness
+
+UNIVERSAL RULES (ALL INDUSTRIES):
+  1. Conversational Layer: ALWAYS respond warmly to greetings, thanks, closings
+  2. Knowledge Layer: Domain terminology (AML, fraud, diagnosis, etc.) ALWAYS answerable
+  3. Safety Layer: Harmful operations (committing fraud, unauthorized access) blocked
+
+  Scope is LAYERED: Conversational → Domain → Safety (in that order).
 
 Return ONLY JSON. No commentary."""
 

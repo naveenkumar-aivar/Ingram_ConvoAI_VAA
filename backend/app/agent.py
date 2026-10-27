@@ -90,7 +90,25 @@ def _run_with_strands(system_prompt: str, user_text: str, pack: ContextPack | No
     # Log Bedrock call details
     logger.info(f"[bedrock-call] Preparing Bedrock model invocation")
     logger.info(f"  - Model ID: {settings.bedrock_model_id}")
-    logger.info(f"  - User query: {user_text[:80]}...")
+
+    # Check for PII in user query and mask in logs for audit trail
+    pii_patterns = {
+        "SSN": r"\b\d{3}-\d{2}-\d{4}\b|\b\d{9}\b",
+        "CREDIT_CARD": r"\b\d{4}[-\s]?\d{4}[-\s]?\d{4}[-\s]?\d{4}\b",
+        "PHONE": r"\b\d{3}[-.\s]?\d{3}[-.\s]?\d{4}\b",
+        "EMAIL": r"\b[A-Za-z0-9._%+-]+@[A-Za-z0-9.-]+\.[A-Z|a-z]{2,}\b",
+    }
+    detected_pii = []
+    for pii_type, pattern in pii_patterns.items():
+        if __import__("re").search(pattern, user_text):
+            detected_pii.append(pii_type)
+
+    if detected_pii:
+        logger.warning(f"[bedrock-call] PII detected in query: {', '.join(detected_pii)} (will be masked by guardrails)")
+        logger.info(f"  - User query: [PII-masked query sent to Bedrock]")
+    else:
+        logger.info(f"  - User query: {user_text[:80]}...")
+
     logger.info(f"  - System prompt length: {len(system_prompt)} chars")
     logger.info(f"  - Pack: {pack.meta.pack_id if pack else 'N/A'}")
     

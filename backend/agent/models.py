@@ -128,16 +128,26 @@ class ContextPack(BaseModel):
         s.append(role_line)
         if p.characteristics:
             s.append("Traits: " + ", ".join(p.characteristics) + ".")
-        s.append("Multi-turn dialogue. Stay in character.")
+        s.append("Multi-turn dialogue. Warm, conversational, never robotic.")
 
-        # 2. Scope boundary (the vertical lock) - COMPRESSED
-        s.append("\n## Scope")
-        s.append(f"ONLY {industry} topics. Out-of-scope = refuse.")
+        # 1b. CONVERSATIONAL LAYER (comes FIRST - highest priority for non-domain)
+        # This ensures basic human courtesy is always handled, never refused
+        s.append("\n## Conversational Layer (Always In-Scope)")
+        s.append("ALWAYS respond warmly to:")
+        s.append("- Greetings: 'Hi', 'Hello', 'How are you?'")
+        s.append("- Acknowledgments: 'Thank you', 'Thanks', 'Got it', 'Understood'")
+        s.append("- Closings: 'Goodbye', 'Have a good day', 'Bye'")
+        s.append("- Meta: 'Can you help?', 'What can you do?'")
+        s.append("NEVER refuse these. Basic courtesy builds trust.")
+
+        # 2. Domain Scope boundary (AFTER conversational) - COMPRESSED
+        s.append("\n## Domain Scope")
+        s.append(f"Primary focus: {industry} topics.")
         if self.scope.in_scope:
-            s.append("In: " + "; ".join(self.scope.in_scope) + ".")
+            s.append("In-Scope: " + "; ".join(self.scope.in_scope) + ".")
         if self.scope.out_of_scope:
-            s.append("Out: " + "; ".join(self.scope.out_of_scope) + ".")
-        s.append(f"Refusal: \"{self.scope.refusal_message}\"")
+            s.append("Out-of-Scope: " + "; ".join(self.scope.out_of_scope) + ".")
+        s.append("Out-of-scope topics: acknowledge warmly, redirect conversationally.")
 
         # 2b. Safety & refusals (hard behavioural rules — highest priority) - COMPRESSED
         if self.guardrails.safety_rules:
@@ -150,6 +160,15 @@ class ContextPack(BaseModel):
             s.append("\n## Deny")
             for t in self.guardrails.denied_topics:
                 s.append(f"- {t}")
+
+        # 2d. CRITICAL: Request Classification (prioritizes knowledge over refusal)
+        # Tell the model to classify requests and prioritize appropriately
+        s.append("\n## Request Classification (Priority Order)")
+        s.append("1. CONVERSATIONAL: Greetings, thanks, politeness → Always respond warmly")
+        s.append("2. KNOWLEDGE: 'What is X?', 'Define X?' → Always answer (even if X seems sensitive)")
+        s.append("3. DOMAIN: In-scope questions → Answer with domain expertise")
+        s.append("4. HARMFUL: 'How to perform [harm]?', 'Steps for [illegal]?' → Refuse only here")
+        s.append("5. OUT-OF-SCOPE: Unrelated topics → Acknowledge, redirect warmly")
 
         # 3. Domain glossary (core terms inline; long ones via retrieval) - COMPRESSED
         core = self.core_ontology()
@@ -180,17 +199,19 @@ class ContextPack(BaseModel):
                 s.append(f"- {g}")
 
         # 7. Structured examples (few-shot learning for better generation)
-        s.append("\n## Examples")
-        
-        # Industry-specific example patterns (compressed)
-        if "banking" in industry_lower or "financial" in industry_lower:
-            s.append("Q: What is ACH?\nA: Automated Clearing House—secure bank transfers, 1-3 days.")
-        elif "healthcare" in industry_lower or "medical" in industry_lower:
-            s.append("Q: What to bring?\nA: ID, insurance card, reason for visit.")
-        elif "legal" in industry_lower:
-            s.append("Q: What documents?\nA: ID, contracts, relevant documentation.")
-        else:
-            s.append("Q: Can you help with [topic]?\nA: Yes/No, with reasoning.")
+        # CRITICAL: Show all priority levels with examples
+        s.append("\n## Examples (By Priority)")
+        s.append("1-CONVERSATIONAL:")
+        s.append("  Q: Thank you.\n  A: You're welcome! Happy to help. Is there anything else?")
+        s.append("  Q: Goodbye.\n  A: Goodbye! Have a great day!")
+        s.append("2-KNOWLEDGE:")
+        s.append("  Q: What is [domain term]?\n  A: [Clear, accurate explanation of concept]")
+        s.append("3-DOMAIN:")
+        s.append("  Q: [In-scope question]\n  A: [Domain expertise answer]")
+        s.append("4-HARMFUL:")
+        s.append("  Q: How to [harmful action]?\n  A: I can't help with that. [Redirect to safe alternative]")
+        s.append("5-OUT-OF-SCOPE:")
+        s.append("  Q: [Unrelated topic]\n  A: I specialize in [domain], but [acknowledge]. Can I help with [domain]?")
 
         # 8. Formatting - COMPRESSED
         s.append("\n## Format")

@@ -214,6 +214,24 @@ body { background: var(--bg); color: var(--text); font: 14px -apple-system, 'Seg
   font-family: ui-monospace, SFMono-Regular, Menlo, monospace;
 }
 
+.metric-sep {
+  color: var(--border);
+  margin: 0 4px;
+}
+
+.metrics-row.session-tokens {
+  font-size: 10px;
+  margin-top: 3px;
+  padding: 4px 10px;
+  background: transparent;
+  border: none;
+}
+
+.metrics-row.session-tokens .metric-label,
+.metrics-row.session-tokens .metric-value {
+  color: var(--dim);
+}
+
 /* Evaluation scores section */
 .evaluation {
   background: var(--bg);

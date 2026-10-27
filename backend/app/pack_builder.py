@@ -231,6 +231,46 @@ def _resolve_handoff(inp: BuildInput, existing: dict, report: BuildReport) -> li
     return _parse_handoff(inp.handoff) or _default_handoff()
 
 
+def _sanitize_denied_topics(topics: list[str]) -> list[str]:
+    """Remove any denied_topic that is ONLY a domain term (no action verb).
+
+    Ensures the generator LLM's output doesn't accidentally block domain knowledge
+    by filtering out bare terms like "AML", "fraud", "diagnosis".
+    Keeps only topics with action verbs like "committing", "laundering", "bypassing".
+    """
+    if not topics:
+        return []
+
+    # Action indicators that suggest a harmful OPERATION, not just a bare term
+    # (Generic across all industries; no hardcoded domain lists)
+    ACTION_INDICATORS = {
+        "committing", "performing", "conducting", "executing",
+        "laundering", "bypassing", "circumventing", "evading",
+        "hacking", "stealing", "accessing", "exposing", "disclosing",
+        "falsifying", "forging", "manipulating", "tampering",
+        "unauthorized", "illegal", "unlawful", "prohibited", "forbidden",
+    }
+
+    cleaned = []
+    for topic in (topics or []):
+        if not topic or not isinstance(topic, str):
+            continue
+
+        topic_lower = topic.lower()
+
+        # Keep if it has an action indicator (an operation)
+        # Drop if it's just a bare term (no action verb)
+        has_action = any(verb in topic_lower for verb in ACTION_INDICATORS)
+
+        if has_action:
+            cleaned.append(topic)
+        else:
+            # Log as debug - don't block, just note it for observation
+            logger.debug(f"[guardrails-fallback] Possible bare term '{topic}'  (prefer in-scope guidance)")
+
+    return cleaned[:10]  # Cap at 10 to keep it reasonable
+
+
 def _resolve_guardrails(inp: BuildInput, existing: dict, report: BuildReport) -> Guardrails:
     # Reuse an existing per-name guardrail only when the user adds no new notes.
     if existing.get("guardrails") and not inp.guardrails.strip():
@@ -257,9 +297,10 @@ def _resolve_guardrails(inp: BuildInput, existing: dict, report: BuildReport) ->
         # LLM success path. Harden it so the user's guardrail intent is never
         # dropped: if the model returned empty denied_topics/pii_blocks but the
         # user DID provide guardrail notes, derive those deterministically.
+        # CRITICAL: Sanitize denied_topics to remove bare domain terms.
         return Guardrails(
             safety_rules=data.get("safety_rules", []) or _user_safety(inp),
-            denied_topics=data.get("denied_topics") or _derive_denied_topics(_user_safety(inp)),
+            denied_topics=_sanitize_denied_topics(data.get("denied_topics", [])) or _derive_denied_topics(_user_safety(inp)),
             blocked_phrases=data.get("blocked_phrases", []),
             pii_blocks=data.get("pii_blocks") or _derive_pii_blocks(
                 inp.industry, _user_safety(inp), base.get("pii_blocks", [])
