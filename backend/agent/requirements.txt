@@ -11,4 +11,4 @@ strands-agents>=1.61,<2.0
 strands-agents-tools>=0.8,<1.0
 
 # AgentCore runtime wrapper (serves /invocations + /ping on :8080)
-bedrock-agentcore
+bedrock-agentcore>=1.20,<2.0

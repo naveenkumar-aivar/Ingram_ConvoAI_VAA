@@ -80,12 +80,22 @@ def _run_with_strands(system_prompt: str, user_text: str, pack: ContextPack | No
     """
     from strands import Agent
     from strands.models import BedrockModel
+    from strands.models.model import CacheConfig
     import time
 
     settings = get_settings()
     gr = pack.guardrails if pack else None
 
-    model_kwargs = {"model_id": settings.bedrock_model_id, "region_name": settings.aws_region}
+    # Bedrock prompt caching: "auto" detects Claude/Anthropic models and injects a
+    # cachePoint after the system prompt, so the ~900+ fixed tokens of the pack's
+    # system prompt (persona, scope, ontology, examples) are billed at the cheaper
+    # cache-read rate on every turn after the first instead of full price each time.
+    # No-op (and safe) on non-Anthropic models.
+    model_kwargs = {
+        "model_id": settings.bedrock_model_id,
+        "region_name": settings.aws_region,
+        "cache_config": CacheConfig(strategy="auto"),
+    }
     
     # Log Bedrock call details
     logger.info(f"[bedrock-call] Preparing Bedrock model invocation")
@@ -139,9 +149,15 @@ def _run_with_strands(system_prompt: str, user_text: str, pack: ContextPack | No
         "input_tokens": int(usage.get("inputTokens", 0) or 0),
         "output_tokens": int(usage.get("outputTokens", 0) or 0),
         "latency_ms": latency_ms,
+        "cache_read_input_tokens": int(usage.get("cacheReadInputTokens", 0) or 0),
+        "cache_write_input_tokens": int(usage.get("cacheWriteInputTokens", 0) or 0),
     }
     
-    logger.info(f"[bedrock-call] Metrics: input={metrics['input_tokens']}, output={metrics['output_tokens']}, latency={metrics['latency_ms']}ms")
+    logger.info(
+        f"[bedrock-call] Metrics: input={metrics['input_tokens']}, output={metrics['output_tokens']}, "
+        f"latency={metrics['latency_ms']}ms, cache_read={metrics['cache_read_input_tokens']}, "
+        f"cache_write={metrics['cache_write_input_tokens']}"
+    )
     
     return response_text, metrics
 

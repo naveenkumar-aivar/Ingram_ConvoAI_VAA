@@ -118,6 +118,8 @@ def compare(
         adapted_output_tokens=adapted_metrics.get('output_tokens', 0),
         generic_latency_ms=generic_metrics.get('latency_ms', 0),
         adapted_latency_ms=adapted_metrics.get('latency_ms', 0),
+        adapted_cache_read_input_tokens=adapted_metrics.get('cache_read_input_tokens', 0),
+        adapted_cache_write_input_tokens=adapted_metrics.get('cache_write_input_tokens', 0),
         session_total_input_tokens=session_total_input,
         session_total_output_tokens=session_total_output,
         # Same basis as session_total_*: both bots' usage for this question

@@ -232,6 +232,19 @@ body { background: var(--bg); color: var(--text); font: 14px -apple-system, 'Seg
   color: var(--dim);
 }
 
+.metrics-row.cache-tokens {
+  font-size: 10px;
+  margin-top: 3px;
+  padding: 4px 10px;
+  background: transparent;
+  border: none;
+}
+
+.metrics-row.cache-tokens .metric-value.cache-hit {
+  color: #7ee29a;
+  font-family: ui-monospace, SFMono-Regular, Menlo, monospace;
+}
+
 /* Evaluation scores section */
 .evaluation {
   background: var(--bg);

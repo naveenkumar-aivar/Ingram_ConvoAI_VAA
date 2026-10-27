@@ -246,6 +246,10 @@ function Panel({ kind, title, sub, turns, loading, pending, side }) {
           const latency = side === 'generic' ? t.generic_duration_ms : t.adapted_duration_ms
           const inputTokens = side === 'generic' ? t.generic_input_tokens : t.adapted_input_tokens
           const outputTokens = side === 'generic' ? t.generic_output_tokens : t.adapted_output_tokens
+          // Prompt caching only applies to the adapted side (the pack's system prompt).
+          const cacheRead = side === 'adapted' ? t.adapted_cache_read_input_tokens : null
+          const cacheWrite = side === 'adapted' ? t.adapted_cache_write_input_tokens : null
+          const hasCacheActivity = !!(cacheRead || cacheWrite)
           return (
             <div key={idx} className="exchange">
               <div className="msg user">{t.question}</div>
@@ -265,6 +269,20 @@ function Panel({ kind, title, sub, turns, loading, pending, side }) {
                   </>
                 )}
               </div>
+              {hasCacheActivity && (
+                <div className="metrics-row cache-tokens" title="Bedrock prompt caching: cached tokens are read back at a lower cost instead of being reprocessed in full.">
+                  <span className="metric-label dim">Cache:</span>
+                  {cacheRead > 0 && (
+                    <span className="metric-value cache-hit">{cacheRead} read</span>
+                  )}
+                  {cacheWrite > 0 && (
+                    <>
+                      {cacheRead > 0 && <span className="metric-sep">·</span>}
+                      <span className="metric-value dim">{cacheWrite} written</span>
+                    </>
+                  )}
+                </div>
+              )}
               {(t.session_total_input_tokens != null || t.session_total_output_tokens != null) && (
                 <div className="metrics-row session-tokens">
                   <span className="metric-label dim">Session total:</span>

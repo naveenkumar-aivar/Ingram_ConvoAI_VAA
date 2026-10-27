@@ -306,6 +306,10 @@ class CompareResponse(BaseModel):
     # Bedrock latency (from AWS)
     generic_latency_ms: int = 0
     adapted_latency_ms: int = 0
+    # Bedrock prompt-cache usage (adapted side only — the generic prompt is too
+    # small/variable to benefit). 0 on a cache write (first turn) or cache miss.
+    adapted_cache_read_input_tokens: int = 0
+    adapted_cache_write_input_tokens: int = 0
     # Session-level cumulative token tracking
     session_total_input_tokens: int = 0
     session_total_output_tokens: int = 0

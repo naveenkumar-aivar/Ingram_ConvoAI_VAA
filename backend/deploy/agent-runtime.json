@@ -11,7 +11,7 @@
   "description": "Vertical Adaptation Agent — conversational + pack-generator agent.",
   "environmentVariables": {
     "AWS_REGION": "us-east-1",
-    "BEDROCK_MODEL_ID": "us.anthropic.claude-haiku-4-5-20251001-v1:0",
+    "BEDROCK_MODEL_ID": "us.anthropic.claude-sonnet-4-5-20250929-v1:0",
     "S3_BUCKET": "vertical-adaption-agent",
     "CONTEXT_PACK_PREFIX": "context-pack/",
     "INDUSTRY_DOCS_PREFIX": "industry-docs/",
